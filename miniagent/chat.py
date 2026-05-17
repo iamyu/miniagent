@@ -1,0 +1,255 @@
+"""Chat engine - interfaces with Qwen via DashScope OpenAI-compatible API."""
+
+from typing import Any
+
+from openai import OpenAI
+
+from .config import load_config
+from .skills import Skill, SkillsLoader
+from .tools import ToolRegistry, create_default_tools
+
+
+class ChatEngine:
+    """Core chat engine: builds prompts with skills, calls LLM, manages history.
+
+    Supports OpenAI function calling for tool execution.
+    """
+
+    def __init__(self, config: dict[str, Any] | None = None):
+        self.config = config or load_config()
+        self.history: list[dict[str, Any]] = []
+        self.skills = SkillsLoader(
+            self.config.get("skills_dir")
+            or __import__("pathlib").Path.home() / ".miniagent" / "skills"
+        )
+        self.tools = create_default_tools()
+        self._client: OpenAI | None = None
+        self._tool_calls_count = 0
+        self._max_tool_rounds = 10  # Safety limit for tool call loops
+
+    @property
+    def client(self) -> OpenAI:
+        """Lazy-initialize the OpenAI client."""
+        if self._client is None:
+            self._client = OpenAI(
+                api_key=self.config.get("api_key", ""),
+                base_url=self.config.get("base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            )
+        return self._client
+
+    def build_system_prompt(self, active_skills: list[Skill] | None = None) -> str:
+        """Build the full system prompt with skills injected."""
+        # Determine MiniAgent installation root
+        miniagent_root = __import__("pathlib").Path(__file__).resolve().parent.parent
+
+        parts = [self.config.get("system_prompt", "你是一个有帮助的 AI 助手。")]
+
+        # Tool instructions
+        tool_names = self.tools.tool_names
+        if tool_names:
+            parts.append(
+                "# Available Tools\n\n"
+                "You have access to the following tools. When you need to:\n"
+                "- Read/write/edit files -> use read_file, write_file, edit_file, list_dir\n"
+                "- Execute CMD commands (copy, delete, run scripts, etc.) -> use shell\n"
+                "- Run Node.js / JavaScript scripts or inline code -> use run_node\n"
+                "- Run Python scripts or inline code -> use run_python\n"
+                "- Search the web -> use web_search\n"
+                "- Fetch web page content -> use web_fetch\n\n"
+                "# Script Execution\n\n"
+                "Use run_node for JavaScript/Node.js and run_python for Python.\n"
+                "Both support: 'path' (script file) or 'code' (inline code), 'cwd' (working dir), 'timeout', 'args'.\n"
+                "Examples:\n"
+                '- run_node(path="build.js", cwd="my-ppt")\n'
+                '- run_python(code="import os; print(os.getcwd())")\n'
+                '- run_node(path="script.js", args="--production", timeout=120)\n\n'
+                f"# Output Directory\n\n"
+                f"MiniAgent 安装目录: {miniagent_root}\n"
+                f"所有生成的文件（PPT、HTML、文档等）统一输出到: {miniagent_root / 'output'}\n"
+                f"使用 shell/run_node/run_python 时，通过 cwd 参数指向此目录。\n\n"
+                "# Document Saving Rule\n\n"
+                "IMPORTANT: Whenever you generate a complete document (HTML page, Markdown file, "
+                "JSON data, CSV data, code file, or any other structured content), you MUST call "
+                "save_document to save it to disk. Do NOT just output the document in chat — "
+                "always save it as a file so the user can find it later.\n\n"
+                "Use tools proactively. When the user asks you to save, read, "
+                "edit files, run commands or search for information, call the appropriate tool directly. "
+                "Always tell the user what you're doing before/after tool calls."
+            )
+
+        # Always-active skills
+        always_skills = self.skills.get_always_skills()
+        if always_skills:
+            always_content = self.skills.build_context(always_skills)
+            if always_content:
+                parts.append(f"# Active Skills\n\n{always_content}")
+
+        # Specifically activated skills
+        if active_skills:
+            always_names = {s.name for s in always_skills}
+            extra = [s for s in active_skills if s.name not in always_names]
+            if extra:
+                extra_content = self.skills.build_context(extra)
+                if extra_content:
+                    parts.append(f"# Activated Skills\n\n{extra_content}")
+
+        # Skills summary
+        summary = self.skills.build_summary()
+        if summary:
+            parts.append(
+                f"# Available Skills\n\n"
+                f"Auto-match and load relevant skills when user keywords match:\n\n"
+                f"{summary}"
+            )
+
+        return "\n\n---\n\n".join(parts)
+
+    def chat(
+        self,
+        user_input: str,
+        active_skills: list[Skill] | None = None,
+        auto_match: bool = True,
+        stream: bool = False,
+    ) -> str:
+        """Send a message and get the response.
+
+        Supports tool calling: if the model requests a tool call, the tool
+        is executed and the result is fed back to the model automatically.
+
+        Args:
+            user_input: The user's message.
+            active_skills: Explicitly activated skills.
+            auto_match: Whether to auto-match skills by keywords.
+            stream: Whether to stream the final text response.
+
+        Returns:
+            The assistant's final response text.
+        """
+        # Match skills
+        matched_skills = list(active_skills or [])
+        if auto_match:
+            auto_matched = self.skills.match_triggers(user_input)
+            auto_names = {s.name for s in auto_matched}
+            for s in matched_skills:
+                auto_names.discard(s.name)
+            matched_skills.extend([s for s in auto_matched if s.name in auto_names])
+
+        # Build system prompt
+        system_prompt = self.build_system_prompt(matched_skills)
+
+        # Build messages
+        messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+        messages.extend(self.history)
+        messages.append({"role": "user", "content": user_input})
+
+        # Log matched skills
+        if matched_skills:
+            names = [s.name for s in matched_skills]
+            print(f"\n  [Skills: {', '.join(names)}]")
+
+        # Tool calling loop
+        self._tool_calls_count = 0
+        tool_definitions = self.tools.get_definitions()
+
+        while self._tool_calls_count < self._max_tool_rounds:
+            # Call LLM
+            kwargs: dict[str, Any] = {
+                "model": self.config.get("model", "qwen-plus"),
+                "messages": messages,
+                "temperature": self.config.get("temperature", 0.7),
+                "max_tokens": self.config.get("max_tokens", 4096),
+            }
+            if tool_definitions:
+                kwargs["tools"] = tool_definitions
+
+            try:
+                resp = self.client.chat.completions.create(**kwargs)
+            except Exception as e:
+                error_text = f"[Error] API call failed: {e}"
+                self._update_history(user_input, error_text)
+                return error_text
+
+            choice = resp.choices[0]
+            message = choice.message
+
+            # Add assistant message to conversation
+            assistant_msg: dict[str, Any] = {"role": "assistant", "content": message.content}
+            if message.tool_calls:
+                assistant_msg["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in message.tool_calls
+                ]
+            messages.append(assistant_msg)
+
+            # No tool calls -> we're done
+            if not message.tool_calls:
+                response_text = message.content or ""
+                if stream and response_text:
+                    print(f"Assistant > {response_text}")
+                # Update history (without tool call artifacts)
+                self._update_history(user_input, response_text)
+                return response_text
+
+            # Execute tool calls
+            for tool_call in message.tool_calls:
+                fn_name = tool_call.function.name
+                fn_args_str = tool_call.function.arguments or "{}"
+
+                # Parse arguments
+                try:
+                    fn_args = __import__("json").loads(fn_args_str)
+                    if not isinstance(fn_args, dict):
+                        fn_args = {}
+                except json.JSONDecodeError:
+                    fn_args = {}
+
+                # Log tool call
+                arg_preview = ", ".join(f"{k}={repr(v)[:60]}" for k, v in fn_args.items())
+                print(f"  [Tool: {fn_name}({arg_preview})]")
+
+                # Execute
+                result = self.tools.execute(fn_name, fn_args)
+                self._tool_calls_count += 1
+
+                # Log result (truncated)
+                if len(result) > 200:
+                    print(f"  [Result: {result[:200]}...]")
+                else:
+                    print(f"  [Result: {result}]")
+
+                # Add tool result to messages
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result,
+                })
+
+        # Exceeded max tool rounds
+        response_text = "[Notice] Reached maximum tool call rounds. Please try again with a simpler request."
+        self._update_history(user_input, response_text)
+        return response_text
+
+    def _update_history(self, user_input: str, response_text: str) -> None:
+        """Update conversation history (clean, without tool artifacts)."""
+        self.history.append({"role": "user", "content": user_input})
+        self.history.append({"role": "assistant", "content": response_text})
+
+        # Trim history
+        max_h = self.config.get("max_history", 20)
+        if max_h > 0 and len(self.history) > max_h * 2:
+            self.history = self.history[-(max_h * 2):]
+
+    def clear_history(self) -> None:
+        """Clear conversation history."""
+        self.history.clear()
+
+    def reload_skills(self) -> None:
+        """Reload skills from disk."""
+        self.skills.reload()
