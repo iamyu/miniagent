@@ -10,6 +10,9 @@ const state = {
     ws: null,
     wsConnected: false,
     currentAssistant: null,  // { content, tools[] }
+    currentSessionId: null,  // current session ID from server
+    wsReconnectAttempts: 0,  // track reconnection attempts
+    wsMaxReconnectDelay: 30000,  // max 30s between retries
 };
 
 const API_BASE = '';
@@ -26,22 +29,34 @@ document.addEventListener('DOMContentLoaded', async () => {
 function connectWS() {
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = `${protocol}//${location.host}/api/ws`;
+
+    // Close existing connection if any
+    if (state.ws && (state.ws.readyState === WebSocket.OPEN || state.ws.readyState === WebSocket.CONNECTING)) {
+        state.ws.onclose = null;  // prevent re-entry
+        state.ws.close();
+    }
+
     state.ws = new WebSocket(url);
 
     state.ws.onopen = () => {
         state.wsConnected = true;
+        state.wsReconnectAttempts = 0;  // reset on successful connect
         updateWSStatus('connected');
     };
 
     state.ws.onclose = () => {
         state.wsConnected = false;
         updateWSStatus('disconnected');
-        setTimeout(connectWS, 3000);
+        // Exponential backoff: 1s, 2s, 4s, 8s... up to 30s
+        const delay = Math.min(1000 * Math.pow(2, state.wsReconnectAttempts), state.wsMaxReconnectDelay);
+        state.wsReconnectAttempts++;
+        console.log(`[WS] Disconnected, reconnecting in ${delay}ms (attempt ${state.wsReconnectAttempts})`);
+        setTimeout(connectWS, delay);
     };
 
-    state.ws.onerror = () => {
-        state.wsConnected = false;
-        updateWSStatus('disconnected');
+    state.ws.onerror = (e) => {
+        // Don't update status here — onclose will fire right after
+        console.error('[WS] Error:', e);
     };
 
     state.ws.onmessage = (event) => {
@@ -117,10 +132,19 @@ function handleWSMessage(msg) {
 
 // ============ Events ============
 function initEventListeners() {
-    // Navigation
+    // Navigation - skip new-chat-btn, it has its own handler
     document.querySelectorAll('.nav-item').forEach(item => {
-        item.addEventListener('click', () => switchView(item.dataset.view));
+        item.addEventListener('click', () => {
+            if (item.id === 'new-chat-btn') return;  // handled separately
+            switchView(item.dataset.view);
+        });
     });
+
+    // New chat button - creates a new session
+    const newChatBtn = document.getElementById('new-chat-btn');
+    if (newChatBtn) {
+        newChatBtn.addEventListener('click', () => newSession());
+    }
 
     // Feature cards
     document.querySelectorAll('.feature-card').forEach(card => {
@@ -172,6 +196,9 @@ function initEventListeners() {
             closeSkillsDropdown();
         }
     });
+
+    // Initialize history
+    initHistoryRefresh();
 }
 
 // ============ View Switch ============
@@ -257,11 +284,22 @@ function sendMessage() {
 
     appendUserMessage(text);
 
+    // Update chat title with first message
+    const chatTitle = document.getElementById('chat-title');
+    if (chatTitle && chatTitle.textContent === '新对话') {
+        chatTitle.textContent = text.substring(0, 10).replace(/\n/g, ' ').trim() + (text.length > 10 ? '...' : '');
+    }
+
     if (state.wsConnected) {
         sendWS({ message: text });
     } else {
+        // WS not connected — try HTTP fallback and remind user
+        appendSystemMessage('WebSocket 未连接，使用 HTTP 模式发送...');
         sendViaHTTP(text);
     }
+
+    // Refresh history after a delay (to pick up the new message in DB)
+    setTimeout(() => { loadHistory(); }, 2500);
 }
 
 async function sendViaHTTP(text) {
@@ -288,6 +326,26 @@ async function sendViaHTTP(text) {
 function clearChat() {
     fetch(`${API_BASE}/api/clear`, { method: 'POST' });
     clearChatUI();
+}
+
+async function newSession() {
+    try {
+        const res = await fetch(`${API_BASE}/api/new-session`, { method: 'POST' });
+        const data = await res.json();
+        if (data.session_id) {
+            state.currentSessionId = data.session_id;
+        }
+    } catch (e) {
+        console.error('Failed to create new session:', e);
+    }
+
+    // Switch to chat view and clear UI
+    switchView('chat');
+    clearChatUI();
+    document.getElementById('chat-title').textContent = '新对话';
+
+    // Refresh history to show the old session
+    loadHistory();
 }
 
 // ============ Message Rendering ============
@@ -653,3 +711,173 @@ function escapeHtml(text) {
 function escapeAttr(text) {
     return text.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
+
+// ============ History Management ============
+
+async function loadHistory() {
+    const container = document.getElementById('history-sidebar');
+    if (!container) return;
+
+    container.innerHTML = '<div class="history-loading">加载中...</div>';
+
+    try {
+        const response = await fetch(`${API_BASE}/api/recent-sessions?limit=20`);
+        const data = await response.json();
+
+        if (data.error) {
+            container.innerHTML = `<div class="history-empty">加载失败</div>`;
+            return;
+        }
+
+        if (!data.sessions || data.sessions.length === 0) {
+            container.innerHTML = '<div class="history-empty">暂无历史记录</div>';
+            return;
+        }
+
+        container.innerHTML = data.sessions.map(session => {
+            // Title: prefer DB title, fallback to first 10 chars of first message
+            const title = session.title
+                || (session.first_message ? session.first_message.substring(0, 10) : '未命名对话');
+
+            const isActive = session.session_id === state.currentSessionId;
+
+            return `
+                <div class="history-item ${isActive ? 'active' : ''}"
+                     data-session-id="${escapeAttr(session.session_id)}"
+                     title="${escapeAttr(session.first_message || title)}">
+                    <div class="history-item-user">${escapeHtml(title)}</div>
+                    <div class="history-item-preview">${escapeHtml(truncateText(session.first_message || '', 40))}</div>
+                    <div class="history-item-time">${formatTime(session.updated_at)} · ${session.message_count || 0}条</div>
+                </div>
+            `;
+        }).join('');
+
+        // Click to load session
+        container.querySelectorAll('.history-item').forEach(item => {
+            item.addEventListener('click', () => {
+                loadSession(item.dataset.sessionId);
+            });
+        });
+
+    } catch (error) {
+        console.error('Failed to load history:', error);
+        container.innerHTML = '<div class="history-empty">加载失败</div>';
+    }
+}
+
+async function loadSession(sessionId) {
+    try {
+        // Switch engine to this session
+        const switchRes = await fetch(`${API_BASE}/api/sessions/${sessionId}/switch`, { method: 'POST' });
+        const switchData = await switchRes.json();
+        if (switchData.session_id) {
+            state.currentSessionId = switchData.session_id;
+        }
+
+        // Load messages
+        const msgRes = await fetch(`${API_BASE}/api/sessions/${sessionId}/messages?limit=100`);
+        const msgData = await msgRes.json();
+
+        if (msgData.error) {
+            appendSystemMessage('加载对话失败: ' + msgData.error);
+            return;
+        }
+
+        // Clear and rebuild UI
+        clearChatUI();
+
+        const messages = msgData.messages || [];
+        if (messages.length === 0) {
+            return;
+        }
+
+        // Render all messages
+        for (const msg of messages) {
+            if (msg.role === 'user') {
+                appendUserMessage(msg.content);
+            } else if (msg.role === 'assistant') {
+                // For historical messages, just show as static text
+                removeWelcome();
+                const container = document.getElementById('chat-messages');
+                const div = document.createElement('div');
+                div.className = 'message assistant';
+                div.innerHTML = `
+                    <div class="message-avatar">M</div>
+                    <div class="message-content">${formatMessageContent(msg.content)}</div>
+                `;
+                container.appendChild(div);
+            }
+        }
+
+        scrollToBottom();
+
+        // Update chat title
+        const title = messages.find(m => m.role === 'user');
+        if (title) {
+            document.getElementById('chat-title').textContent =
+                title.content.substring(0, 10).replace(/\n/g, ' ').trim() + '...';
+        }
+
+        // Switch to chat view
+        switchView('chat');
+
+        // Refresh history to update active state
+        loadHistory();
+
+    } catch (error) {
+        console.error('Failed to load session:', error);
+        appendSystemMessage('加载对话失败');
+    }
+}
+
+function truncateText(text, maxLength) {
+    if (!text) return '';
+    return text.length > maxLength ? text.substring(0, maxLength) + '...' : text;
+}
+
+function formatTime(timestamp) {
+    if (!timestamp) return '';
+    try {
+        const date = new Date(timestamp);
+        const now = new Date();
+        const diff = now - date;
+
+        // Less than 1 hour
+        if (diff < 3600000) {
+            const minutes = Math.floor(diff / 60000);
+            return minutes < 1 ? '刚刚' : `${minutes}分钟前`;
+        }
+
+        // Less than 24 hours
+        if (diff < 86400000) {
+            const hours = Math.floor(diff / 3600000);
+            return `${hours}小时前`;
+        }
+
+        // More than 24 hours
+        const days = Math.floor(diff / 86400000);
+        if (days < 7) {
+            return `${days}天前`;
+        }
+
+        // Show date
+        return date.toLocaleDateString('zh-CN');
+    } catch (e) {
+        return '';
+    }
+}
+
+function initHistoryRefresh() {
+    const refreshBtn = document.getElementById('refresh-history');
+    if (refreshBtn) {
+        refreshBtn.addEventListener('click', () => {
+            loadHistory();
+        });
+    }
+
+    // Auto-load history on page load
+    setTimeout(() => {
+        loadHistory();
+    }, 1000);
+}
+

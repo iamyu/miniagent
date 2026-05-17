@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from .chat import ChatEngine
 from .config import load_config, get_config_path, get_app_dir
 from .skills import Skill
+from openai import AsyncOpenAI
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +101,59 @@ async def api_skills():
     return result
 
 
+@app.get("/api/history")
+async def api_history(limit: int = 50):
+    """Return conversation history from database."""
+    engine = get_engine()
+    try:
+        history = engine.load_history_from_db(limit=limit)
+        return {"history": history, "count": len(history)}
+    except Exception as e:
+        return {"error": str(e), "history": [], "count": 0}
+
+
+@app.get("/api/recent-sessions")
+async def api_recent_sessions(limit: int = 10):
+    """Return recent conversation sessions with first message preview."""
+    engine = get_engine()
+    try:
+        sessions = engine.db.get_all_sessions(limit=limit)
+        return {"sessions": sessions}
+    except Exception as e:
+        return {"error": str(e), "sessions": []}
+
+
+@app.post("/api/new-session")
+async def api_new_session():
+    """Start a new conversation session.
+
+    The current session is preserved in the database with an auto-generated title.
+    Returns the new session_id.
+    """
+    engine = get_engine()
+    new_id = engine.new_session()
+    return {"status": "ok", "session_id": new_id}
+
+
+@app.get("/api/sessions/{session_id}/messages")
+async def api_session_messages(session_id: str, limit: int = 100):
+    """Get all messages for a specific session."""
+    engine = get_engine()
+    try:
+        messages = engine.db.get_session_messages(session_id, limit=limit)
+        return {"session_id": session_id, "messages": messages, "count": len(messages)}
+    except Exception as e:
+        return {"error": str(e), "messages": [], "count": 0}
+
+
+@app.post("/api/sessions/{session_id}/switch")
+async def api_switch_session(session_id: str):
+    """Switch to an existing session and load its history into the engine."""
+    engine = get_engine()
+    messages = engine.switch_to_session(session_id)
+    return {"status": "ok", "session_id": session_id, "messages": messages}
+
+
 @app.post("/api/chat")
 async def api_chat(body: dict[str, Any]):
     """Synchronous chat endpoint."""
@@ -165,15 +219,26 @@ async def ws_chat(ws: WebSocket):
             # Stream the chat response
             try:
                 await _stream_chat(engine, ws, user_input)
+            except WebSocketDisconnect:
+                raise
             except Exception as e:
-                await ws.send_json({"type": "error", "content": str(e)})
+                print(f"[WS] Error in _stream_chat: {e}")
+                try:
+                    await ws.send_json({"type": "error", "content": str(e)})
+                except Exception:
+                    break
 
     except WebSocketDisconnect:
         pass
+    except Exception as e:
+        print(f"[WS] Unexpected error: {e}")
 
 
 async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
-    """Stream a chat response via WebSocket, sending tool calls in real-time."""
+    """Stream a chat response via WebSocket, sending tool calls in real-time.
+
+    Uses AsyncOpenAI to avoid blocking the event loop during streaming.
+    """
     # Match skills
     matched_skills = []
     auto_matched = engine.skills.match_triggers(user_input)
@@ -198,6 +263,12 @@ async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
     tool_rounds = 0
     max_rounds = 10
 
+    # Create async OpenAI client (lightweight, per-request is fine)
+    async_client = AsyncOpenAI(
+        api_key=engine.config.get("api_key", ""),
+        base_url=engine.config.get("base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+    )
+
     while tool_rounds < max_rounds:
         kwargs: dict[str, Any] = {
             "model": engine.config.get("model", "qwen-plus"),
@@ -210,17 +281,15 @@ async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
             kwargs["tools"] = tool_definitions
 
         try:
-            # Use streaming API
-            stream = await asyncio.to_thread(
-                lambda: engine.client.chat.completions.create(**kwargs)
-            )
+            # Use AsyncOpenAI — async for properly yields to event loop
+            stream = await async_client.chat.completions.create(**kwargs)
 
-            # Collect streamed content
+            # Collect streamed content (non-blocking)
             content_parts = []
             tool_calls_data: dict[int, dict] = {}  # index -> tool call data
             finish_reason = None
 
-            for chunk in stream:
+            async for chunk in stream:
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
@@ -304,7 +373,7 @@ async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
                 "args": fn_args,
             })
 
-            # Execute tool
+            # Execute tool (run in thread to avoid blocking event loop)
             result = await asyncio.to_thread(engine.tools.execute, fn_name, fn_args)
             tool_rounds += 1
 

@@ -1,12 +1,16 @@
 """Chat engine - interfaces with Qwen via DashScope OpenAI-compatible API."""
 
+import json
+import uuid
 from typing import Any
+from pathlib import Path
 
 from openai import OpenAI
 
 from .config import load_config
 from .skills import Skill, SkillsLoader
 from .tools import ToolRegistry, create_default_tools
+from .database import HistoryDB
 
 
 class ChatEngine:
@@ -20,12 +24,16 @@ class ChatEngine:
         self.history: list[dict[str, Any]] = []
         self.skills = SkillsLoader(
             self.config.get("skills_dir")
-            or __import__("pathlib").Path.home() / ".miniagent" / "skills"
+            or Path.home() / ".miniagent" / "skills"
         )
         self.tools = create_default_tools()
         self._client: OpenAI | None = None
         self._tool_calls_count = 0
         self._max_tool_rounds = 10  # Safety limit for tool call loops
+        
+        # Initialize database for persistent history
+        self.db = HistoryDB()
+        self.session_id = "default"  # Can be customized per session
 
     @property
     def client(self) -> OpenAI:
@@ -40,7 +48,7 @@ class ChatEngine:
     def build_system_prompt(self, active_skills: list[Skill] | None = None) -> str:
         """Build the full system prompt with skills injected."""
         # Determine MiniAgent installation root
-        miniagent_root = __import__("pathlib").Path(__file__).resolve().parent.parent
+        miniagent_root = Path(__file__).resolve().parent.parent
 
         parts = [self.config.get("system_prompt", "你是一个有帮助的 AI 助手。")]
 
@@ -204,7 +212,7 @@ class ChatEngine:
 
                 # Parse arguments
                 try:
-                    fn_args = __import__("json").loads(fn_args_str)
+                    fn_args = json.loads(fn_args_str)
                     if not isinstance(fn_args, dict):
                         fn_args = {}
                 except json.JSONDecodeError:
@@ -241,7 +249,23 @@ class ChatEngine:
         self.history.append({"role": "user", "content": user_input})
         self.history.append({"role": "assistant", "content": response_text})
 
-        # Trim history
+        # Save to database for persistence
+        try:
+            self.db.save_conversation_pair(
+                user_input=user_input,
+                assistant_response=response_text,
+                session_id=self.session_id
+            )
+
+            # Auto-title the session with the first user message (first 10 chars)
+            if len(self.history) == 2:
+                title = user_input[:10].replace('\n', ' ').strip()
+                if title:
+                    self.db.update_session_title(self.session_id, title)
+        except Exception as e:
+            print(f"Warning: Failed to save history to database: {e}")
+
+        # Trim in-memory history
         max_h = self.config.get("max_history", 20)
         if max_h > 0 and len(self.history) > max_h * 2:
             self.history = self.history[-(max_h * 2):]
@@ -249,6 +273,77 @@ class ChatEngine:
     def clear_history(self) -> None:
         """Clear conversation history."""
         self.history.clear()
+        # Also clear from database
+        try:
+            self.db.clear_history(self.session_id)
+        except Exception as e:
+            print(f"Warning: Failed to clear history from database: {e}")
+
+    def new_session(self) -> str:
+        """Start a new conversation session.
+
+        If the current session has messages, it is preserved in the database
+        and titled with the first user message (first 10 characters).
+
+        Returns:
+            The new session_id
+        """
+        old_session_id = self.session_id
+
+        # Title the old session if it has messages in memory
+        if self.history:
+            try:
+                for msg in self.history:
+                    if msg.get("role") == "user":
+                        title = msg["content"][:10].replace('\n', ' ').strip()
+                        if title:
+                            self.db.update_session_title(old_session_id, title)
+                        break
+                # Also try DB in case history was trimmed
+                else:
+                    first = self.db.get_first_user_message(old_session_id)
+                    if first:
+                        title = first[:10].replace('\n', ' ').strip()
+                        if title:
+                            self.db.update_session_title(old_session_id, title)
+            except Exception:
+                pass
+
+        # Generate new session_id
+        new_id = uuid.uuid4().hex[:12]
+        self.session_id = new_id
+        self.history.clear()
+        return new_id
+
+    def switch_to_session(self, session_id: str) -> list[dict[str, Any]]:
+        """Switch to an existing session and load its history.
+
+        Args:
+            session_id: The session to switch to
+
+        Returns:
+            List of messages in the session
+        """
+        self.session_id = session_id
+        self.history = []
+        try:
+            messages = self.db.get_session_messages(session_id)
+            for msg in messages:
+                self.history.append({"role": msg["role"], "content": msg["content"]})
+            return messages
+        except Exception:
+            return []
+
+    def load_history_from_db(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Load conversation history from database.
+        
+        Args:
+            limit: Maximum number of messages to load
+            
+        Returns:
+            List of message dictionaries
+        """
+        return self.db.get_history(session_id=self.session_id, limit=limit)
 
     def reload_skills(self) -> None:
         """Reload skills from disk."""
