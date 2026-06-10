@@ -678,17 +678,34 @@ class ShellTool(Tool):
             import subprocess
             import os as _os
 
-            # Build PATH with bundled runtimes prepended
+            # Build PATH with bundled runtimes prepended + npm/pip env vars
             env = dict(_os.environ)
-            runtime_dirs = []
+            runtime_dirs: list[str] = []
             # Bundled with miniagent package
             bundled_runtime = Path(__file__).resolve().parent.parent / "runtime"
             if bundled_runtime.exists():
-                for sub in ("node", "python"):
-                    d = bundled_runtime / sub
-                    if d.exists():
-                        runtime_dirs.append(str(d))
-            # Project-level runtime
+                # Node runtime
+                node_dir = bundled_runtime / "node"
+                if node_dir.exists():
+                    runtime_dirs.append(str(node_dir))
+                    # npm cache in runtime directory (avoid downloading repeatedly)
+                    env["NPM_CONFIG_CACHE"] = str(node_dir / ".npm-cache")
+                    # Global node_modules lookup path (pre-installed packages)
+                    # Use a separate global_node_modules dir to avoid polluting node's own runtime
+                    global_nm = node_dir / "global_node_modules"
+                    if not global_nm.exists():
+                        global_nm.mkdir(parents=True, exist_ok=True)
+                    existing_np = env.get("NODE_PATH", "")
+                    env["NODE_PATH"] = str(global_nm) + (_os.pathsep + existing_np if existing_np else "")
+                    # Playwright browsers stored in runtime (not output dir)
+                    env["PLAYWRIGHT_BROWSERS_PATH"] = str(node_dir / ".playwright-browsers")
+                # Python runtime
+                python_dir = bundled_runtime / "python"
+                if python_dir.exists():
+                    runtime_dirs.append(str(python_dir))
+                    # pip cache in runtime directory
+                    env["PIP_CACHE_DIR"] = str(python_dir / ".pip-cache")
+            # Project-level runtime (fallback)
             project_runtime = Path(cwd) / "runtime" if cwd else Path.cwd() / "runtime"
             if project_runtime.exists():
                 for sub in ("node", "python"):
@@ -847,6 +864,17 @@ class RunNodeTool(Tool):
         import os as _os
         clean_env = {k: v for k, v in _os.environ.items()
                      if k not in ("NODE_OPTIONS",)}
+        # Set NODE_PATH to find globally pre-installed packages in runtime
+        bundled_runtime = Path(__file__).resolve().parent.parent / "runtime"
+        node_dir = bundled_runtime / "node"
+        if node_dir.exists():
+            global_nm = node_dir / "global_node_modules"
+            if not global_nm.exists():
+                global_nm.mkdir(parents=True, exist_ok=True)
+            existing_np = clean_env.get("NODE_PATH", "")
+            clean_env["NODE_PATH"] = str(global_nm) + (_os.pathsep + existing_np if existing_np else "")
+            clean_env["NPM_CONFIG_CACHE"] = str(node_dir / ".npm-cache")
+            clean_env["PLAYWRIGHT_BROWSERS_PATH"] = str(node_dir / ".playwright-browsers")
 
         try:
             if code:
@@ -998,6 +1026,13 @@ class RunPythonTool(Tool):
                 if args:
                     cmd.extend(args.split())
 
+            # Build env with runtime pip cache
+            run_env = dict(_os.environ)
+            bundled_runtime = Path(__file__).resolve().parent.parent / "runtime"
+            python_dir = bundled_runtime / "python"
+            if python_dir.exists():
+                run_env["PIP_CACHE_DIR"] = str(python_dir / ".pip-cache")
+
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -1006,6 +1041,7 @@ class RunPythonTool(Tool):
                 cwd=cwd or None,
                 encoding="utf-8",
                 errors="replace",
+                env=run_env,
             )
 
             parts = []

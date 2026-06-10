@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from .chat import ChatEngine
 from .config import load_config, get_config_path, get_app_dir
 from .skills import Skill
+from .utils import sanitize_tool_arguments, log_api_error, logger
 from openai import AsyncOpenAI
 
 
@@ -154,6 +155,17 @@ async def api_switch_session(session_id: str):
     return {"status": "ok", "session_id": session_id, "messages": messages}
 
 
+@app.delete("/api/sessions/{session_id}")
+async def api_delete_session(session_id: str):
+    """Delete a session and all its messages."""
+    engine = get_engine()
+    try:
+        engine.db.clear_history(session_id)
+        return {"status": "ok", "session_id": session_id}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
 @app.post("/api/chat")
 async def api_chat(body: dict[str, Any]):
     """Synchronous chat endpoint."""
@@ -261,7 +273,7 @@ async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
 
     tool_definitions = engine.tools.get_definitions()
     tool_rounds = 0
-    max_rounds = 10
+    max_rounds = 30
 
     # Create async OpenAI client (lightweight, per-request is fine)
     async_client = AsyncOpenAI(
@@ -325,9 +337,20 @@ async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
                     finish_reason = chunk.choices[0].finish_reason
 
         except Exception as e:
+            # Log active tool call data before crash
+            if tool_calls_data:
+                logger.error(f"[ws_stream] tool_calls_data at crash: {json.dumps(tool_calls_data, ensure_ascii=False)[:1000]}")
+            error_text = log_api_error(e, "WS streaming API call", messages)
             await ws.send_json({"type": "error", "content": f"API error: {e}"})
-            engine._update_history(user_input, f"[Error] {e}")
+            engine._update_history(user_input, error_text)
             return
+
+        # Debug log: show collected tool call data
+        if tool_calls_data:
+            logger.debug(
+                f"[ws_stream] round={tool_rounds}, tool_calls="
+                f"{json.dumps({k: {'name': v['name'], 'args_preview': v['arguments'][:200]} for k, v in tool_calls_data.items()}, ensure_ascii=False)}"
+            )
 
         # Build assistant message
         full_content = "".join(content_parts)
@@ -341,7 +364,10 @@ async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
                     "type": "function",
                     "function": {
                         "name": tc["name"],
-                        "arguments": tc["arguments"],
+                        "arguments": sanitize_tool_arguments(
+                            tc["arguments"],
+                            tc["name"],
+                        ),
                     },
                 }
                 for tc in ordered_calls
@@ -364,6 +390,10 @@ async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
                 if not isinstance(fn_args, dict):
                     fn_args = {}
             except json.JSONDecodeError:
+                logger.warning(
+                    f"[ws_tool] JSON decode failed for '{fn_name}', "
+                    f"raw={fn_args_str[:200]}"
+                )
                 fn_args = {}
 
             # Notify client about tool call

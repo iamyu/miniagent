@@ -290,6 +290,10 @@ function sendMessage() {
         chatTitle.textContent = text.substring(0, 10).replace(/\n/g, ' ').trim() + (text.length > 10 ? '...' : '');
     }
 
+    // Show typing indicator immediately
+    state.currentAssistant = { content: '', tools: [] };
+    appendAssistantBubble();
+
     if (state.wsConnected) {
         sendWS({ message: text });
     } else {
@@ -297,9 +301,6 @@ function sendMessage() {
         appendSystemMessage('WebSocket 未连接，使用 HTTP 模式发送...');
         sendViaHTTP(text);
     }
-
-    // Refresh history after a delay (to pick up the new message in DB)
-    setTimeout(() => { loadHistory(); }, 2500);
 }
 
 async function sendViaHTTP(text) {
@@ -407,21 +408,23 @@ function appendAssistantBubble() {
     div.id = 'current-assistant-msg';
     div.innerHTML = `
         <div class="message-avatar">M</div>
-        <div class="message-content" id="current-assistant-content">
-            <div class="typing-indicator">
-                <div class="typing-dot"></div>
-                <div class="typing-dot"></div>
-                <div class="typing-dot"></div>
+        <div class="message-content">
+            <div id="current-assistant-text">
+                <div class="typing-indicator">
+                    <div class="typing-dot"></div>
+                    <div class="typing-dot"></div>
+                    <div class="typing-dot"></div>
+                </div>
             </div>
+            <div id="current-tool-cards"></div>
         </div>
-        <div id="current-tool-cards"></div>
     `;
     container.appendChild(div);
     scrollToBottom();
 }
 
 function updateAssistantBubble(content) {
-    const el = document.getElementById('current-assistant-content');
+    const el = document.getElementById('current-assistant-text');
     if (el) {
         el.innerHTML = formatMessageContent(content);
         scrollToBottom();
@@ -468,6 +471,8 @@ function updateToolCard(toolInfo, idx) {
             }
             body.innerHTML += html;
         }
+        // Auto-expand when inside chat bubble so user can see the result
+        card.classList.add('expanded');
     }
 }
 
@@ -475,8 +480,8 @@ function finalizeAssistantMessage() {
     if (state.currentAssistant) {
         const el = document.getElementById('current-assistant-msg');
         if (el) el.removeAttribute('id');
-        const content = document.getElementById('current-assistant-content');
-        if (content) content.removeAttribute('id');
+        const text = document.getElementById('current-assistant-text');
+        if (text) text.removeAttribute('id');
         const tools = document.getElementById('current-tool-cards');
         if (tools) tools.removeAttribute('id');
         state.currentAssistant = null;
@@ -726,13 +731,17 @@ async function loadHistory() {
 
         if (data.error) {
             container.innerHTML = `<div class="history-empty">加载失败</div>`;
+            updateHistoryCount(0);
             return;
         }
 
         if (!data.sessions || data.sessions.length === 0) {
             container.innerHTML = '<div class="history-empty">暂无历史记录</div>';
+            updateHistoryCount(0);
             return;
         }
+
+        updateHistoryCount(data.sessions.length);
 
         container.innerHTML = data.sessions.map(session => {
             // Title: prefer DB title, fallback to first 10 chars of first message
@@ -748,20 +757,66 @@ async function loadHistory() {
                     <div class="history-item-user">${escapeHtml(title)}</div>
                     <div class="history-item-preview">${escapeHtml(truncateText(session.first_message || '', 40))}</div>
                     <div class="history-item-time">${formatTime(session.updated_at)} · ${session.message_count || 0}条</div>
+                    <button class="history-delete-btn" title="删除此对话" data-sid="${escapeAttr(session.session_id)}">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polyline points="3 6 5 6 21 6"/>
+                            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                        </svg>
+                    </button>
                 </div>
             `;
         }).join('');
 
         // Click to load session
         container.querySelectorAll('.history-item').forEach(item => {
-            item.addEventListener('click', () => {
+            item.addEventListener('click', (e) => {
+                // Don't trigger when clicking delete button
+                if (e.target.closest('.history-delete-btn')) return;
                 loadSession(item.dataset.sessionId);
+            });
+        });
+
+        // Delete button handlers
+        container.querySelectorAll('.history-delete-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const sid = btn.dataset.sid;
+                if (confirm('确定要删除这个历史对话吗？')) {
+                    deleteSession(sid);
+                }
             });
         });
 
     } catch (error) {
         console.error('Failed to load history:', error);
         container.innerHTML = '<div class="history-empty">加载失败</div>';
+        updateHistoryCount(0);
+    }
+}
+
+function updateHistoryCount(count) {
+    const el = document.getElementById('history-count');
+    if (el) el.textContent = `(${count})`;
+}
+
+async function deleteSession(sessionId) {
+    try {
+        const res = await fetch(`${API_BASE}/api/sessions/${sessionId}`, { method: 'DELETE' });
+        const data = await res.json();
+        if (data.status === 'ok') {
+            // If the deleted session was the current one, clear UI
+            if (state.currentSessionId === sessionId) {
+                state.currentSessionId = null;
+                clearChatUI();
+                document.getElementById('chat-title').textContent = '新对话';
+            }
+            // Refresh the history list
+            loadHistory();
+        } else {
+            console.error('Delete failed:', data.error);
+        }
+    } catch (e) {
+        console.error('Failed to delete session:', e);
     }
 }
 
@@ -872,6 +927,18 @@ function initHistoryRefresh() {
     if (refreshBtn) {
         refreshBtn.addEventListener('click', () => {
             loadHistory();
+        });
+    }
+
+    // Collapse/expand toggle
+    const toggleBtn = document.getElementById('toggle-history');
+    if (toggleBtn) {
+        toggleBtn.addEventListener('click', () => {
+            const historyList = document.getElementById('history-sidebar');
+            if (historyList) {
+                historyList.classList.toggle('collapsed');
+                toggleBtn.classList.toggle('collapsed');
+            }
         });
     }
 

@@ -11,6 +11,7 @@ from .config import load_config
 from .skills import Skill, SkillsLoader
 from .tools import ToolRegistry, create_default_tools
 from .database import HistoryDB
+from .utils import sanitize_tool_arguments, log_api_error, logger
 
 
 class ChatEngine:
@@ -29,7 +30,7 @@ class ChatEngine:
         self.tools = create_default_tools()
         self._client: OpenAI | None = None
         self._tool_calls_count = 0
-        self._max_tool_rounds = 10  # Safety limit for tool call loops
+        self._max_tool_rounds = 30  # Safety limit for tool call loops
         
         # Initialize database for persistent history
         self.db = HistoryDB()
@@ -173,7 +174,7 @@ class ChatEngine:
             try:
                 resp = self.client.chat.completions.create(**kwargs)
             except Exception as e:
-                error_text = f"[Error] API call failed: {e}"
+                error_text = log_api_error(e, "CLI API call", messages)
                 self._update_history(user_input, error_text)
                 return error_text
 
@@ -189,7 +190,10 @@ class ChatEngine:
                         "type": "function",
                         "function": {
                             "name": tc.function.name,
-                            "arguments": tc.function.arguments,
+                            "arguments": sanitize_tool_arguments(
+                                tc.function.arguments or "{}",
+                                tc.function.name,
+                            ),
                         },
                     }
                     for tc in message.tool_calls
