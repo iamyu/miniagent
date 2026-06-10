@@ -145,7 +145,42 @@ body {
     flex-shrink: 0;
 }
 .chat-header h2 { font-size: 16px; font-weight: 600; }
+.chat-header-status { flex: 1; display: flex; align-items: center; justify-content: center; }
 .chat-actions { display: flex; gap: 8px; }
+
+/* Processing indicator in header */
+.processing-indicator {
+    display: flex; align-items: center; gap: 8px;
+    padding: 4px 12px; border-radius: 8px;
+    background: var(--primary-light);
+    animation: fadeIn 0.3s ease;
+}
+.processing-spinner {
+    width: 16px; height: 16px;
+    border: 2px solid var(--primary-light);
+    border-top-color: var(--primary);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+.processing-text {
+    font-size: 13px; font-weight: 500; color: var(--primary);
+}
+
+/* Progress bar at top of messages */
+.progress-bar-container {
+    height: 3px; background: var(--bg-tertiary);
+    overflow: hidden; flex-shrink: 0;
+}
+.progress-bar {
+    height: 100%; width: 40%;
+    background: var(--primary);
+    animation: progressSlide 1.5s ease-in-out infinite;
+    border-radius: 2px;
+}
+@keyframes progressSlide {
+    0%   { transform: translateX(-100%); }
+    100% { transform: translateX(350%); }
+}
 
 .action-btn {
     width: 36px; height: 36px; border: none;

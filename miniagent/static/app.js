@@ -104,6 +104,7 @@ function handleWSMessage(msg) {
             result: null, done: false, truncated: false
         });
         appendToolCard(msg.name, msg.args);
+        showProcessing(`调用工具: ${msg.name}...`);
     }
     else if (type === 'tool_end') {
         const tools = state.currentAssistant?.tools;
@@ -114,6 +115,7 @@ function handleWSMessage(msg) {
             last.done = true;
             updateToolCard(last, tools.length - 1);
         }
+        showProcessing('生成中...');
     }
     else if (type === 'done') {
         finalizeAssistantMessage();
@@ -121,6 +123,7 @@ function handleWSMessage(msg) {
     else if (type === 'error') {
         finalizeAssistantMessage();
         appendSystemMessage(msg.content);
+        hideProcessing();
     }
     else if (type === 'system') {
         appendSystemMessage(msg.content);
@@ -278,6 +281,7 @@ function sendMessage() {
 
     state.isStreaming = true;
     document.getElementById('send-btn').disabled = true;
+    showProcessing('思考中...');
 
     input.value = '';
     input.style.height = 'auto';
@@ -321,6 +325,10 @@ async function sendViaHTTP(text) {
         }
     } catch (e) {
         appendSystemMessage('Network error: ' + e.message);
+    } finally {
+        hideProcessing();
+        state.isStreaming = false;
+        document.getElementById('send-btn').disabled = !document.getElementById('chat-input').value.trim();
     }
 }
 
@@ -351,6 +359,9 @@ async function newSession() {
 
 // ============ Message Rendering ============
 function clearChatUI() {
+    hideProcessing();
+    state.isStreaming = false;
+    state.currentAssistant = null;
     const container = document.getElementById('chat-messages');
     container.innerHTML = `
         <div class="welcome-message">
@@ -487,6 +498,7 @@ function finalizeAssistantMessage() {
         state.currentAssistant = null;
     }
     state.isStreaming = false;
+    hideProcessing();
     document.getElementById('send-btn').disabled = !document.getElementById('chat-input').value.trim();
     scrollToBottom();
 }
@@ -705,6 +717,22 @@ function copyCode(id) {
             }
         });
     }
+}
+
+function showProcessing(text) {
+    const indicator = document.getElementById('processing-indicator');
+    const bar = document.getElementById('progress-bar-container');
+    const label = document.getElementById('processing-text');
+    if (indicator) indicator.style.display = 'flex';
+    if (bar) bar.style.display = 'block';
+    if (label) label.textContent = text || '处理中...';
+}
+
+function hideProcessing() {
+    const indicator = document.getElementById('processing-indicator');
+    const bar = document.getElementById('progress-bar-container');
+    if (indicator) indicator.style.display = 'none';
+    if (bar) bar.style.display = 'none';
 }
 
 function escapeHtml(text) {

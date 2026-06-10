@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import difflib
 import shutil
@@ -12,6 +13,8 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from .utils import logger as _log
 
 
 class Tool(ABC):
@@ -611,10 +614,14 @@ class ShellTool(Tool):
 
     # Commands that are too dangerous to run without explicit confirmation
     _DANGEROUS_PATTERNS = [
-        "format ", "del /s", "del /q", "rmdir /s", "rd /s",
+        "del /s", "del /q", "rmdir /s", "rd /s",
         "diskpart", "bcdedit", "reg delete", "net user",
         "shutdown", "taskkill /f", "wmic",
     ]
+
+    # Regex for CMD disk format command: matches "format C:", "format d: /q"
+    # but NOT PowerShell parameters like "-Format '...'" or "echo format C:"
+    _FORMAT_REGEX = re.compile(r'(?:^|[\n;&|])\s*format\s+[a-z]\s*:', re.IGNORECASE | re.MULTILINE)
 
     @property
     def name(self) -> str:
@@ -664,7 +671,7 @@ class ShellTool(Tool):
         # Normalize timeout
         timeout = min(max(timeout or 30, 1), self.MAX_TIMEOUT)
 
-        # Safety check: warn but don't block dangerous commands
+        # Safety check: block genuinely dangerous commands
         cmd_lower = command.lower().strip()
         for pattern in self._DANGEROUS_PATTERNS:
             if pattern in cmd_lower:
@@ -673,39 +680,24 @@ class ShellTool(Tool):
                     f"The pattern '{pattern}' is considered dangerous. "
                     f"If you really need this, run it manually in CMD."
                 )
+        # Extra: block "format X:" disk formatting (but not PowerShell -Format)
+        if self._FORMAT_REGEX.search(command):
+            return (
+                "Error: Command blocked for safety. "
+                "Disk formatting commands (format X:) are not allowed. "
+                "If you really need this, run it manually in CMD."
+            )
 
         try:
             import subprocess
             import os as _os
 
-            # Build PATH with bundled runtimes prepended + npm/pip env vars
+            # Build environment: start from current process env (bundled runtimes
+            # already in PATH via _setup_runtime_environment), then add any
+            # project-level (cwd-relative) runtime dirs as additional fallback.
             env = dict(_os.environ)
             runtime_dirs: list[str] = []
-            # Bundled with miniagent package
-            bundled_runtime = Path(__file__).resolve().parent.parent / "runtime"
-            if bundled_runtime.exists():
-                # Node runtime
-                node_dir = bundled_runtime / "node"
-                if node_dir.exists():
-                    runtime_dirs.append(str(node_dir))
-                    # npm cache in runtime directory (avoid downloading repeatedly)
-                    env["NPM_CONFIG_CACHE"] = str(node_dir / ".npm-cache")
-                    # Global node_modules lookup path (pre-installed packages)
-                    # Use a separate global_node_modules dir to avoid polluting node's own runtime
-                    global_nm = node_dir / "global_node_modules"
-                    if not global_nm.exists():
-                        global_nm.mkdir(parents=True, exist_ok=True)
-                    existing_np = env.get("NODE_PATH", "")
-                    env["NODE_PATH"] = str(global_nm) + (_os.pathsep + existing_np if existing_np else "")
-                    # Playwright browsers stored in runtime (not output dir)
-                    env["PLAYWRIGHT_BROWSERS_PATH"] = str(node_dir / ".playwright-browsers")
-                # Python runtime
-                python_dir = bundled_runtime / "python"
-                if python_dir.exists():
-                    runtime_dirs.append(str(python_dir))
-                    # pip cache in runtime directory
-                    env["PIP_CACHE_DIR"] = str(python_dir / ".pip-cache")
-            # Project-level runtime (fallback)
+            # Project-level runtime (cwd-relative fallback)
             project_runtime = Path(cwd) / "runtime" if cwd else Path.cwd() / "runtime"
             if project_runtime.exists():
                 for sub in ("node", "python"):
@@ -714,8 +706,6 @@ class ShellTool(Tool):
                         runtime_dirs.append(str(d))
             if runtime_dirs:
                 env["PATH"] = _os.pathsep.join(runtime_dirs + env.get("PATH", "").split(_os.pathsep))
-                # Also clean NODE_OPTIONS for shell mode
-                env.pop("NODE_OPTIONS", None)
 
             result = subprocess.run(
                 command,
@@ -760,6 +750,140 @@ class ShellTool(Tool):
             return f"Error: Command not found: {e}"
         except Exception as e:
             return f"Error executing command: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Runtime Environment Setup (process-level only)
+# ---------------------------------------------------------------------------
+
+def _setup_runtime_environment() -> None:
+    """Configure Node.js & Python runtime environment at process level.
+
+    Based on __file__, calculates absolute paths and:
+    1. Prepends runtime/node/ to os.environ['PATH'] (process-level only)
+    2. Prepends runtime/python/ to os.environ['PATH']
+    3. Sets NODE_PATH, NPM_CONFIG_CACHE, PLAYWRIGHT_BROWSERS_PATH
+    4. Sets PIP_CACHE_DIR
+    5. Removes NODE_OPTIONS to avoid conflicts with bundled Node.js
+
+    This ONLY affects os.environ within the current process and its
+    subprocesses. Does NOT modify the system/user global environment.
+    Child processes automatically inherit these settings, ensuring
+    the local Node.js/Python runtimes are always preferred over any
+    system-wide installations.
+    """
+    import os as _os
+
+    # Calculate absolute path to package root based on this file's location
+    _package_root = Path(__file__).resolve().parent.parent
+    _runtime_root = _package_root / "runtime"
+
+    # --- Node.js runtime ---
+    _node_dir = _runtime_root / "node"
+    if _node_dir.is_dir():
+        # Prepend node directory to process PATH (avoid duplicates)
+        _current_path = _os.environ.get("PATH", "")
+        _node_dir_str = str(_node_dir)
+        _path_entries = _current_path.split(_os.pathsep)
+        if _node_dir_str not in _path_entries:
+            _os.environ["PATH"] = _node_dir_str + _os.pathsep + _current_path
+
+        # NPM cache: store downloaded packages in runtime dir (persistent)
+        _os.environ["NPM_CONFIG_CACHE"] = str(_node_dir / ".npm-cache")
+
+        # NODE_PATH: resolve global node_modules for pre-installed packages
+        # npm --prefix creates node_modules INSIDE global_node_modules,
+        # so NODE_PATH must point to the inner node_modules directory.
+        _global_nm = _node_dir / "global_node_modules" / "node_modules"
+        _global_nm.mkdir(parents=True, exist_ok=True)
+        _existing_np = _os.environ.get("NODE_PATH", "")
+        _os.environ["NODE_PATH"] = (
+            str(_global_nm)
+            + (_os.pathsep + _existing_np if _existing_np else "")
+        )
+
+        # Playwright browser binaries stored inside runtime (not output dir)
+        _os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(
+            _node_dir / ".playwright-browsers"
+        )
+
+        # --- Domestic mirrors for faster downloads ---
+        _os.environ.setdefault("npm_config_registry", "https://registry.npmmirror.com")
+        # Playwright browser download mirror
+        _os.environ.setdefault(
+            "PLAYWRIGHT_DOWNLOAD_HOST",
+            "https://npmmirror.com/mirrors/playwright",
+        )
+
+        # Remove NODE_OPTIONS to avoid conflicts with bundled Node.js
+        _os.environ.pop("NODE_OPTIONS", None)
+
+        # --- Debug: log PATH and Node.js env configuration ---
+        _node_exe = _node_dir / "node.exe"
+        _log.debug(
+            "[runtime_env] Node.js runtime configured:\n"
+            "  node_dir      = %s\n"
+            "  node_exe      = %s\n"
+            "  NODE_PATH     = %s\n"
+            "  NPM_CONFIG_CACHE = %s\n"
+            "  PLAYWRIGHT_BROWSERS_PATH = %s\n"
+            "  npm_config_registry = %s\n"
+            "  PLAYWRIGHT_DOWNLOAD_HOST = %s",
+            _node_dir_str,
+            str(_node_exe),
+            _os.environ.get("NODE_PATH", ""),
+            _os.environ.get("NPM_CONFIG_CACHE", ""),
+            _os.environ.get("PLAYWRIGHT_BROWSERS_PATH", ""),
+            _os.environ.get("npm_config_registry", ""),
+            _os.environ.get("PLAYWRIGHT_DOWNLOAD_HOST", ""),
+        )
+
+        # --- Verify: run node --version ---
+        if _node_exe.is_file():
+            try:
+                _ver_result = subprocess.run(
+                    [_node_exe, "--version"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                _ver = _ver_result.stdout.strip()
+                _log.debug("[runtime_env] Node.js version: %s", _ver)
+            except Exception:
+                _log.warning(
+                    "[runtime_env] Node.js found but failed to run --version"
+                )
+
+    # --- Python runtime ---
+    _python_dir = _runtime_root / "python"
+    if _python_dir.is_dir():
+        _python_dir_str = str(_python_dir)
+        _current_path = _os.environ.get("PATH", "")
+        _path_entries = _current_path.split(_os.pathsep)
+        if _python_dir_str not in _path_entries:
+            _os.environ["PATH"] = _python_dir_str + _os.pathsep + _current_path
+
+        # pip cache inside runtime dir
+        _os.environ["PIP_CACHE_DIR"] = str(_python_dir / ".pip-cache")
+
+        # Domestic mirror for pip
+        _os.environ.setdefault(
+            "PIP_INDEX_URL",
+            "https://pypi.tuna.tsinghua.edu.cn/simple",
+        )
+
+    # --- Debug: dump final PATH head ---
+    _final_path = _os.environ.get("PATH", "")
+    _path_parts = _final_path.split(_os.pathsep)
+    _log.debug(
+        "[runtime_env] Final PATH head (first %d entries):\n  %s",
+        min(5, len(_path_parts)),
+        "\n  ".join(_path_parts[:5]),
+    )
+
+
+# Execute at module import time — child processes will inherit these settings
+_setup_runtime_environment()
 
 
 # ---------------------------------------------------------------------------
@@ -860,21 +984,12 @@ class RunNodeTool(Tool):
                 "Download portable Node.js from https://nodejs.org and place in runtime/node/"
             )
 
-        # Build clean environment (remove NODE_OPTIONS which may cause issues)
+        # Use current process environment (bundled Node.js runtime already
+        # in PATH, and NODE_PATH / NPM_CONFIG_CACHE / PLAYWRIGHT_BROWSERS_PATH
+        # / NODE_OPTIONS(removed) already configured by _setup_runtime_environment
+        # at module import time).
         import os as _os
-        clean_env = {k: v for k, v in _os.environ.items()
-                     if k not in ("NODE_OPTIONS",)}
-        # Set NODE_PATH to find globally pre-installed packages in runtime
-        bundled_runtime = Path(__file__).resolve().parent.parent / "runtime"
-        node_dir = bundled_runtime / "node"
-        if node_dir.exists():
-            global_nm = node_dir / "global_node_modules"
-            if not global_nm.exists():
-                global_nm.mkdir(parents=True, exist_ok=True)
-            existing_np = clean_env.get("NODE_PATH", "")
-            clean_env["NODE_PATH"] = str(global_nm) + (_os.pathsep + existing_np if existing_np else "")
-            clean_env["NPM_CONFIG_CACHE"] = str(node_dir / ".npm-cache")
-            clean_env["PLAYWRIGHT_BROWSERS_PATH"] = str(node_dir / ".playwright-browsers")
+        clean_env = dict(_os.environ)
 
         try:
             if code:
@@ -1026,12 +1141,10 @@ class RunPythonTool(Tool):
                 if args:
                     cmd.extend(args.split())
 
-            # Build env with runtime pip cache
+            # Use current process environment (bundled Python runtime already
+            # in PATH, and PIP_CACHE_DIR already configured by
+            # _setup_runtime_environment at module import time).
             run_env = dict(_os.environ)
-            bundled_runtime = Path(__file__).resolve().parent.parent / "runtime"
-            python_dir = bundled_runtime / "python"
-            if python_dir.exists():
-                run_env["PIP_CACHE_DIR"] = str(python_dir / ".pip-cache")
 
             result = subprocess.run(
                 cmd,
