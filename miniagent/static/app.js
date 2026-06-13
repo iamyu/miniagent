@@ -99,25 +99,45 @@ function handleWSMessage(msg) {
             state.currentAssistant = { content: '', tools: [] };
             appendAssistantBubble();
         }
-        state.currentAssistant.tools.push({
+        const toolEntry = {
             name: msg.name, args: msg.args,
             result: null, done: false, truncated: false
-        });
-        appendToolCard(msg.name, msg.args);
-        showProcessing(`调用工具: ${msg.name}...`);
+        };
+        state.currentAssistant.tools.push(toolEntry);
+        // Use msg.index if provided, otherwise fall back to array position
+        const cardIdx = msg.index !== undefined ? msg.index : state.currentAssistant.tools.length - 1;
+        console.debug(`[tool_start] name=${msg.name}, index=${cardIdx}, args_type=${typeof msg.args}`);
+        appendToolCard(msg.name, msg.args, cardIdx);
+        showProcessing('模型正在生成参数: ' + msg.name + '...');
+    }
+    else if (type === 'tool_args') {
+        // Stream raw tool call arguments into the tool card in real-time
+        const idx = msg.index !== undefined ? msg.index : 0;
+        console.debug(`[tool_args] idx=${idx}, len=${msg.content?.length || 0}, preview=${(msg.content || '').substring(0, 60)}`);
+        appendToolCardArgs(idx, msg.content);
     }
     else if (type === 'tool_end') {
         const tools = state.currentAssistant?.tools;
-        if (tools && tools.length > 0) {
-            const last = tools[tools.length - 1];
-            last.result = msg.result;
-            last.truncated = msg.truncated;
-            last.done = true;
-            updateToolCard(last, tools.length - 1);
+        const idx = msg.index !== undefined ? msg.index : (tools ? tools.length - 1 : 0);
+        if (tools && idx < tools.length) {
+            const tool = tools[idx];
+            tool.result = msg.result;
+            tool.truncated = msg.truncated;
+            tool.done = true;
+            updateToolCard(tool, idx);
         }
-        showProcessing('生成中...');
+        // Show completed tools count
+        const doneCount = state.currentAssistant?.tools.filter(t => t.done).length || 0;
+        const totalCount = state.currentAssistant?.tools.length || 0;
+        showProcessing('已完成 ' + doneCount + '/' + totalCount + ' 个工具, 生成回答中...');
     }
     else if (type === 'done') {
+        // Show tool completion summary as a system message
+        const toolCount = state.currentAssistant?.tools?.length || 0;
+        if (toolCount > 0) {
+            const doneCount = state.currentAssistant.tools.filter(t => t.done).length;
+            appendSystemMessage('✓ 工具执行完成 (' + doneCount + '/' + toolCount + ')');
+        }
         finalizeAssistantMessage();
     }
     else if (type === 'error') {
@@ -130,6 +150,10 @@ function handleWSMessage(msg) {
     }
     else if (type === 'status') {
         appendSystemMessage(msg.content);
+    }
+    else if (type === 'processing') {
+        // Update the processing indicator text (no new message, just update status line)
+        showProcessing(msg.content);
     }
 }
 
@@ -190,6 +214,10 @@ function initEventListeners() {
     // Clear
     document.getElementById('clear-chat').addEventListener('click', clearChat);
 
+    // Save settings
+    const saveSettingsBtn = document.getElementById('btn-save-settings');
+    if (saveSettingsBtn) saveSettingsBtn.addEventListener('click', saveSettings);
+
     // Skills dropdown
     document.getElementById('skills-toggle-btn').addEventListener('click', toggleSkillsDropdown);
     document.addEventListener('click', (e) => {
@@ -233,14 +261,58 @@ async function loadConfig() {
         if (modelInput) modelInput.value = state.config.model || '';
         if (baseUrlInput) baseUrlInput.value = state.config.base_url || '';
         if (tempInput) tempInput.value = state.config.temperature || 0.7;
-        if (maxTokensInput) maxTokensInput.value = state.config.max_tokens || 4096;
+        if (maxTokensInput) maxTokensInput.value = state.config.max_tokens || 8192;
     } catch (e) {
         console.error('Failed to load config:', e);
     }
 }
 
+async function saveSettings() {
+    const btn = document.getElementById('btn-save-settings');
+    const originalText = btn.textContent;
+    btn.textContent = '保存中...';
+    btn.disabled = true;
+
+    try {
+        const payload = {
+            model: document.getElementById('setting-model')?.value || undefined,
+            base_url: document.getElementById('setting-base-url')?.value || undefined,
+            temperature: document.getElementById('setting-temperature')?.value || undefined,
+            max_tokens: document.getElementById('setting-max-tokens')?.value || undefined,
+        };
+        // Remove empty values to avoid overwriting with blanks
+        Object.keys(payload).forEach(k => { if (payload[k] === undefined || payload[k] === '') delete payload[k]; });
+
+        const res = await fetch(`${API_BASE}/api/config`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        if (data.ok) {
+            btn.textContent = '✓ 已保存';
+            btn.classList.add('saved');
+            setTimeout(() => {
+                btn.textContent = originalText;
+                btn.classList.remove('saved');
+            }, 2000);
+            // Reload config into state
+            await loadConfig();
+        } else {
+            btn.textContent = '保存失败';
+            alert('保存失败: ' + (data.error || '未知错误'));
+            setTimeout(() => { btn.textContent = originalText; btn.disabled = false; }, 2000);
+        }
+    } catch (e) {
+        btn.textContent = '网络错误';
+        console.error('Save settings failed:', e);
+        setTimeout(() => { btn.textContent = originalText; btn.disabled = false; }, 2000);
+    }
+}
+
 function renderSkillsSidebar() {
     const container = document.getElementById('skills-sidebar');
+    if (!container) return;  // element doesn't exist in current layout
     if (!state.skills || state.skills.length === 0) {
         container.innerHTML = '<div class="sidebar-info-item">暂无 Skills</div>';
         return;
@@ -281,22 +353,25 @@ function sendMessage() {
 
     state.isStreaming = true;
     document.getElementById('send-btn').disabled = true;
-    showProcessing('思考中...');
 
     input.value = '';
     input.style.height = 'auto';
 
+    // Show user message first, then assistant bubble
     appendUserMessage(text);
+
+    // Show typing indicator (create bubble so processing element exists)
+    state.currentAssistant = { content: '', tools: [] };
+    appendAssistantBubble();
+
+    // Now show processing text inside the bubble
+    showProcessing('正在调用大模型...');
 
     // Update chat title with first message
     const chatTitle = document.getElementById('chat-title');
     if (chatTitle && chatTitle.textContent === '新对话') {
         chatTitle.textContent = text.substring(0, 10).replace(/\n/g, ' ').trim() + (text.length > 10 ? '...' : '');
     }
-
-    // Show typing indicator immediately
-    state.currentAssistant = { content: '', tools: [] };
-    appendAssistantBubble();
 
     if (state.wsConnected) {
         sendWS({ message: text });
@@ -420,6 +495,7 @@ function appendAssistantBubble() {
     div.innerHTML = `
         <div class="message-avatar">M</div>
         <div class="message-content">
+            <div id="current-tool-cards"></div>
             <div id="current-assistant-text">
                 <div class="typing-indicator">
                     <div class="typing-dot"></div>
@@ -427,7 +503,7 @@ function appendAssistantBubble() {
                     <div class="typing-dot"></div>
                 </div>
             </div>
-            <div id="current-tool-cards"></div>
+            <div id="processing-indicator" class="processing-indicator" style="display:none"></div>
         </div>
     `;
     container.appendChild(div);
@@ -442,25 +518,46 @@ function updateAssistantBubble(content) {
     }
 }
 
-function appendToolCard(name, args) {
+function appendToolCard(name, args, idx) {
     const container = document.getElementById('current-tool-cards');
     if (!container) return;
-    const idx = container.children.length;
-    const argsStr = typeof args === 'object' ? JSON.stringify(args, null, 2) : String(args);
+    // Dedup: skip if card already exists
+    if (document.getElementById(`tool-card-${idx}`)) return;
+    const argsStr = (args && typeof args === 'object')
+        ? JSON.stringify(args, null, 2)
+        : (typeof args === 'string' ? args : String(args || ''));
     const card = document.createElement('div');
-    card.className = 'tool-card';
+    card.className = 'tool-card expanded';  // expanded by default
     card.id = `tool-card-${idx}`;
     card.innerHTML = `
         <div class="tool-card-header" onclick="toggleToolCard(${idx})">
             <span class="tool-icon">&#9881;</span>
             <span class="tool-name">${escapeHtml(name)}</span>
-            <span class="tool-status running" id="tool-status-${idx}">Running...</span>
+            <span class="tool-status running" id="tool-status-${idx}">生成参数中...</span>
         </div>
         <div class="tool-card-body">
-            <div class="tool-args">${escapeHtml(argsStr)}</div>
+            <div class="tool-args" id="tool-args-${idx}">${escapeHtml(argsStr)}</div>
         </div>
     `;
     container.appendChild(card);
+    scrollToBottom();
+}
+
+// Stream args text into an existing tool card in real-time
+function appendToolCardArgs(idx, chunk) {
+    const argsEl = document.getElementById(`tool-args-${idx}`);
+    if (!argsEl) {
+        console.warn(`[tool_args] element #tool-args-${idx} not found`);
+        return;
+    }
+    const current = argsEl.textContent || '';
+    // Limit to 5000 chars to avoid DOM bloat with huge HTML
+    if (current.length > 5000) return;
+    argsEl.textContent = current + chunk;
+    // Also track in state for later use (e.g., file preview)
+    if (state.currentAssistant && state.currentAssistant.tools[idx]) {
+        state.currentAssistant.tools[idx].args = (state.currentAssistant.tools[idx].args || '') + chunk;
+    }
     scrollToBottom();
 }
 
@@ -469,9 +566,12 @@ function updateToolCard(toolInfo, idx) {
     if (!card) return;
     const status = document.getElementById(`tool-status-${idx}`);
     if (status) {
-        status.textContent = 'Done';
+        status.textContent = '已完成';
         status.className = 'tool-status done';
     }
+    // Hide streamed args area — only show result when done
+    const argsEl = card.querySelector(`#tool-args-${idx}`);
+    if (argsEl) argsEl.style.display = 'none';
     if (toolInfo.result) {
         const body = card.querySelector('.tool-card-body');
         if (body) {
@@ -482,21 +582,36 @@ function updateToolCard(toolInfo, idx) {
             }
             body.innerHTML += html;
         }
-        // Auto-expand when inside chat bubble so user can see the result
-        card.classList.add('expanded');
     }
 }
 
 function finalizeAssistantMessage() {
     if (state.currentAssistant) {
+        // Clean up transitional status phrases from LLM output (e.g. "正在生成文件...")
+        const textEl = document.getElementById('current-assistant-text');
+        if (state.currentAssistant.content) {
+            state.currentAssistant.content = state.currentAssistant.content
+                .replace(/\*{0,2}正在(生成|执行|处理|保存|写入|创建|准备)[^\n]*\.{3,}\*{0,2}\s*\n?/g, '')
+                .replace(/^\s+|\s+$/g, '');
+        }
+
+        // If no text content was generated but tools were executed, show a summary
+        if (textEl && !state.currentAssistant.content && state.currentAssistant.tools.length > 0) {
+            const doneCount = state.currentAssistant.tools.filter(t => t.done).length;
+            const toolNames = state.currentAssistant.tools.map(t => t.name).join(', ');
+            const summary = `✓ 通过 ${toolNames} 完成了 ${doneCount} 个工具调用`;
+            state.currentAssistant.content = summary;
+            textEl.innerHTML = `<p>${escapeHtml(summary)}</p>`;
+        }
+
         const el = document.getElementById('current-assistant-msg');
         if (el) el.removeAttribute('id');
-        const text = document.getElementById('current-assistant-text');
-        if (text) text.removeAttribute('id');
+        if (textEl) textEl.removeAttribute('id');
         const tools = document.getElementById('current-tool-cards');
         if (tools) tools.removeAttribute('id');
-        state.currentAssistant = null;
+        hideProcessing();
     }
+    state.currentAssistant = null;
     state.isStreaming = false;
     hideProcessing();
     document.getElementById('send-btn').disabled = !document.getElementById('chat-input').value.trim();
@@ -510,7 +625,7 @@ function appendSystemMessage(text) {
     div.className = 'message system';
     div.innerHTML = `
         <div class="message-avatar">&#9432;</div>
-        <div class="message-content">${escapeHtml(text)}</div>
+        <div class="message-content">${formatMessageContent(text)}</div>
     `;
     container.appendChild(div);
     scrollToBottom();
@@ -519,12 +634,44 @@ function appendSystemMessage(text) {
 // ============ Markdown Rendering ============
 function formatMessageContent(content) {
     if (!content) return '';
-    let html = escapeHtml(content);
 
-    // Code blocks
+    // ---- Step 0: Extract code blocks BEFORE any HTML stripping ----
+    // Code blocks may contain HTML that looks like LLM-generated tags.
+    const cbBlocks = [];
+    let clean = content.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+        cbBlocks.push({ lang, code });
+        return `%%CB_${cbBlocks.length - 1}%%`;
+    });
+
+    // ---- Step 1: Strip raw HTML tags the LLM might have generated ----
+    // The LLM sometimes wraps its reply in <p>, generates <a class="file-link">, etc.
+    // If we let them be escaped, &lt;a ...&gt; won't be caught by the anchor protection
+    // regex below, so the bare-path regex will match paths INSIDE escaped hrefs
+    // and create nested <a> tags.
+    clean = clean.replace(/<br\s*\/?>/gi, '\n');
+    clean = clean.replace(/<\/p>/gi, '\n').replace(/<p[^>]*>/gi, '');
+    clean = clean.replace(/<\/div>/gi, '\n').replace(/<div[^>]*>/gi, '');
+    // <a ...>...</a> — keep only the link text (we build proper links below)
+    clean = clean.replace(/<a\b[^>]*>(.*?)<\/a>/gi, '$1');
+
+    // ---- Step 2: Escape + restore code blocks ----
+    let html = escapeHtml(clean);
+
+    // Restore code blocks (escape their content for <code> display)
+    html = html.replace(/%%CB_(\d+)%%/g, (_, i) => {
+        const b = cbBlocks[parseInt(i)];
+        return '```' + b.lang + '\n' + escapeHtml(b.code) + '```';
+    });
+
+    // ---- Step 3: Standard markdown processing ----
+    // Code blocks → styled HTML
+    const codeBlocks = [];
     html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
         const id = 'cb-' + Math.random().toString(36).substr(2, 6);
-        return `<div style="position:relative"><pre><code id="${id}">${code.trim()}</code></pre><button class="code-copy-btn" onclick="copyCode('${id}')">Copy</button></div>`;
+        codeBlocks.push(
+            `<div style="position:relative"><pre><code id="${id}">${code.trim()}</code></pre><button class="code-copy-btn" onclick="copyCode('${id}')">Copy</button></div>`
+        );
+        return `%%CODEBLOCK_${codeBlocks.length - 1}%%`;
     });
 
     // Inline code
@@ -533,8 +680,60 @@ function formatMessageContent(content) {
     // Bold
     html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
 
-    // Links
+    // Markdown links [text](url)
     html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+
+    // ---- File-path detection ----
+    // Only absolute paths (with drive letter e.g. "D:\...") get clickable
+    // file:// links. Relative paths (e.g. "report.html") are NOT converted
+    // because they can't be opened via the file:// protocol.
+    //
+    // Runs BEFORE anchor protection so any new <a> tags we create here
+    // are protected from the bare-path regex below.
+    const linkedPaths = new Set();
+
+    function _norm(p) {
+        return p.replace(/\\/g, '/').replace(/\/{2,}/g, '/');
+    }
+
+    function buildFileLink(path) {
+        const escaped = path.replace(/"/g, '&quot;');
+        return `<span class="file-link" data-path="${escaped}" onclick="copyFilePath(this)" title="点击复制路径">${path}</span>`;
+    }
+
+    // <code>-wrapped absolute paths → link (first occurrence only)
+    html = html.replace(/<code>([^<]+)<\/code>/g, (_, codeContent) => {
+        const isAbsPath = /^[A-Za-z]:[/\\][^\s<>"{}()*|]+\.\w{1,10}$/.test(codeContent);
+        if (isAbsPath) {
+            if (linkedPaths.has(_norm(codeContent))) return `<code>${codeContent}</code>`;
+            linkedPaths.add(_norm(codeContent));
+            return buildFileLink(codeContent);
+        }
+        return `<code>${codeContent}</code>`;
+    });
+
+    // Bare absolute paths → link (first occurrence only)
+    const fileExtRe = /([A-Za-z]:[/\\](?:[^\s<>"{}\[\]()*|:;,]+[/\\])*[^\s<>"{}\[\]()*|:;,]+\.[a-zA-Z0-9]{1,10})(?=[\s。，,;；：）\)\]\}>'"\u201d\u2019<]|$)/g;
+    html = html.replace(fileExtRe, (match) => {
+        if (linkedPaths.has(_norm(match))) return match;
+        linkedPaths.add(_norm(match));
+        return buildFileLink(match);
+    });
+
+    // ---- Anchor protection (AFTER all link creation) ----
+    // Wrap every <a> tag so subsequent processing can't break them.
+    const anchorPlaceholders = [];
+    html = html.replace(/<a\b[^>]*>.*?<\/a>/gi, (match) => {
+        const idx = anchorPlaceholders.length;
+        anchorPlaceholders.push(match);
+        return `%%ANCHOR_${idx}%%`;
+    });
+
+    // Restore protected <a> tags
+    html = html.replace(/%%ANCHOR_(\d+)%%/g, (_, i) => anchorPlaceholders[parseInt(i)]);
+
+    // Restore code blocks
+    html = html.replace(/%%CODEBLOCK_(\d+)%%/g, (_, i) => codeBlocks[parseInt(i)]);
 
     // Line breaks
     html = html.replace(/\n\n+/g, '</p><p>');
@@ -719,20 +918,50 @@ function copyCode(id) {
     }
 }
 
+function copyFilePath(el) {
+    const path = el.getAttribute('data-path') || el.textContent;
+    navigator.clipboard.writeText(path).then(() => {
+        el.classList.add('copied');
+        showToast('路径已复制: ' + path);
+        setTimeout(() => el.classList.remove('copied'), 1500);
+    }).catch(() => {
+        showToast('复制失败，请手动复制');
+    });
+}
+
+function showToast(msg) {
+    // Remove existing toast
+    const old = document.querySelector('.miniagent-toast');
+    if (old) old.remove();
+    const toast = document.createElement('div');
+    toast.className = 'miniagent-toast';
+    toast.textContent = msg;
+    document.body.appendChild(toast);
+    // Trigger animation
+    requestAnimationFrame(() => toast.classList.add('show'));
+    setTimeout(() => {
+        toast.classList.remove('show');
+        setTimeout(() => toast.remove(), 300);
+    }, 2000);
+}
+
+
+
+// Processing state: show a small status line below the assistant message
 function showProcessing(text) {
-    const indicator = document.getElementById('processing-indicator');
-    const bar = document.getElementById('progress-bar-container');
-    const label = document.getElementById('processing-text');
-    if (indicator) indicator.style.display = 'flex';
-    if (bar) bar.style.display = 'block';
-    if (label) label.textContent = text || '处理中...';
+    const container = document.getElementById('processing-indicator');
+    if (container) {
+        container.textContent = text;
+        container.style.display = 'block';
+    }
 }
 
 function hideProcessing() {
-    const indicator = document.getElementById('processing-indicator');
-    const bar = document.getElementById('progress-bar-container');
-    if (indicator) indicator.style.display = 'none';
-    if (bar) bar.style.display = 'none';
+    const container = document.getElementById('processing-indicator');
+    if (container) {
+        container.style.display = 'none';
+        container.textContent = '';
+    }
 }
 
 function escapeHtml(text) {

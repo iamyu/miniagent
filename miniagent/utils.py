@@ -44,6 +44,18 @@ def sanitize_tool_arguments(arguments_str: str, tool_name: str = "unknown") -> s
     except json.JSONDecodeError:
         pass
 
+    # Pre-clean: replace real newlines / carriage returns inside JSON string values
+    # with their JSON-escaped equivalents. LLMs often output raw newlines in
+    # large content fields (e.g. HTML in save_document), breaking JSON validity.
+    raw_fixed = raw.replace("\n", "\\n").replace("\r", "\\r")
+    if raw_fixed != raw:
+        try:
+            json.loads(raw_fixed)
+            logger.info(f"[tool_args] repaired arguments for '{tool_name}' by escaping newlines")
+            return raw_fixed
+        except json.JSONDecodeError:
+            pass  # fall through to remaining fixes
+
     # Try common fixes
     fixes_tried = [
         # Fix 1: Remove trailing commas (common LLM mistake)
@@ -76,12 +88,17 @@ def sanitize_tool_arguments(arguments_str: str, tool_name: str = "unknown") -> s
 
 
 def _extract_json_object(s: str) -> str:
-    """Extract the first complete JSON object from a string."""
+    """Extract the first JSON object from a string.
+
+    If a complete object is found (balanced braces), returns it.
+    If the string ends with an unclosed object (truncated), attempts to
+    close it by appending the missing structural characters.
+    """
     depth = 0
     start = -1
     in_string = False
     escape_next = False
-    
+
     for i, ch in enumerate(s):
         if escape_next:
             escape_next = False
@@ -102,7 +119,34 @@ def _extract_json_object(s: str) -> str:
             depth -= 1
             if depth == 0 and start >= 0:
                 return s[start:i+1]
-    
+
+    # No complete object; try to repair truncated JSON
+    if start >= 0 and depth > 0:
+        truncated = s[start:]
+        # Try appending closing braces
+        repaired = truncated + ('}' * depth)
+        try:
+            json.loads(repaired)
+            return repaired
+        except json.JSONDecodeError:
+            pass
+        # If still failing, try closing string first then braces
+        if in_string:
+            repaired = truncated + '"' + ('}' * depth)
+            try:
+                json.loads(repaired)
+                return repaired
+            except json.JSONDecodeError:
+                pass
+            # If content ends with '\', it's a dangling escape char; strip and retry
+            if truncated.endswith('\\'):
+                repaired = truncated[:-1] + '"' + ('}' * depth)
+                try:
+                    json.loads(repaired)
+                    return repaired
+                except json.JSONDecodeError:
+                    pass
+
     return s
 
 
@@ -116,6 +160,57 @@ def _try_python_literal(s: str) -> str:
     except Exception:
         pass
     return s
+
+
+def validate_tool_args(tool_name: str, args: dict) -> tuple[bool, str]:
+    """Validate tool arguments for completeness before execution.
+
+    Catches truncated/incomplete arguments that would produce partial results
+    and trigger infinite model retry loops.
+
+    Returns:
+        (is_valid: bool, message: str)
+    """
+    if not args or not isinstance(args, dict):
+        return False, "Arguments empty or not a dict"
+
+    # Content-writing tools (write_file, save_document): verify content field
+    if tool_name in ("write_file", "save_document"):
+        content = args.get("content", "")
+        if content is None or (isinstance(content, str) and not content.strip()):
+            return False, "Content field is empty or None"
+
+        if isinstance(content, str):
+            content_stripped = content.strip()
+            content_len = len(content_stripped)
+
+            # If it looks like HTML but is too short → likely truncated
+            if content_stripped.startswith("<") and content_len < 50:
+                return False, (
+                    f"HTML-like content too short ({content_len} chars), "
+                    f"likely truncated during streaming"
+                )
+
+            # HTML document: check basic structure completeness
+            lower = content_stripped.lower()
+            if lower.startswith("<!doctype") or lower.startswith("<html"):
+                if not lower.rstrip().endswith("</html>"):
+                    return False, (
+                        f"HTML document appears truncated "
+                        f"(starts with <html/doctype but does not end with </html>)"
+                    )
+
+            # Generic length sanity
+            if content_len < 10:
+                return False, f"Content too short ({content_len} chars)"
+
+    # Shell tool: check command field
+    if tool_name == "shell":
+        command = args.get("command", "")
+        if not command or not command.strip():
+            return False, "Command field is empty"
+
+    return True, "OK"
 
 
 def log_api_error(error: Exception, context: str = "", messages: list | None = None) -> str:

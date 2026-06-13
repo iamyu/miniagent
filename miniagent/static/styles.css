@@ -145,42 +145,10 @@ body {
     flex-shrink: 0;
 }
 .chat-header h2 { font-size: 16px; font-weight: 600; }
-.chat-header-status { flex: 1; display: flex; align-items: center; justify-content: center; }
 .chat-actions { display: flex; gap: 8px; }
 
-/* Processing indicator in header */
-.processing-indicator {
-    display: flex; align-items: center; gap: 8px;
-    padding: 4px 12px; border-radius: 8px;
-    background: var(--primary-light);
-    animation: fadeIn 0.3s ease;
-}
-.processing-spinner {
-    width: 16px; height: 16px;
-    border: 2px solid var(--primary-light);
-    border-top-color: var(--primary);
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-}
-.processing-text {
-    font-size: 13px; font-weight: 500; color: var(--primary);
-}
-
-/* Progress bar at top of messages */
-.progress-bar-container {
-    height: 3px; background: var(--bg-tertiary);
-    overflow: hidden; flex-shrink: 0;
-}
-.progress-bar {
-    height: 100%; width: 40%;
-    background: var(--primary);
-    animation: progressSlide 1.5s ease-in-out infinite;
-    border-radius: 2px;
-}
-@keyframes progressSlide {
-    0%   { transform: translateX(-100%); }
-    100% { transform: translateX(350%); }
-}
+/* Processing state is now shown as typing dots inside message bubbles.
+   The header processing indicator and progress bar have been removed. */
 
 .action-btn {
     width: 36px; height: 36px; border: none;
@@ -293,6 +261,43 @@ body {
 .message-content a { color: var(--primary); text-decoration: none; }
 .message-content a:hover { text-decoration: underline; }
 
+/* Clickable file path link */
+.file-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    margin: 0 2px;
+    background: var(--primary-light);
+    border: 1px solid var(--primary);
+    border-radius: 6px;
+    color: var(--primary) !important;
+    font-family: 'SF Mono', Consolas, monospace;
+    font-size: 12px;
+    cursor: pointer;
+    transition: background 0.15s;
+    text-decoration: none !important;
+}
+.file-link::before {
+    content: '📂';
+    font-size: 12px;
+}
+.file-link:hover {
+    background: var(--primary);
+    color: #fff !important;
+    text-decoration: none !important;
+}
+.file-link::after {
+    content: ' 📋';
+    font-size: 10px;
+    opacity: 0.6;
+}
+.file-link.copied {
+    background: #22c55e;
+    border-color: #22c55e;
+    color: #fff !important;
+}
+
 .code-copy-btn {
     position: absolute; top: 6px; right: 6px;
     background: var(--bg-tertiary); border: 1px solid var(--border);
@@ -306,6 +311,15 @@ body {
     margin: 10px 0; background: var(--bg);
     border: 1px solid var(--border); border-radius: 10px;
     overflow: hidden;
+    transition: border-color 0.3s;
+}
+.tool-card:has(.tool-status.running) {
+    border-color: var(--warning);
+    box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.15);
+}
+.tool-card:has(.tool-status.done) {
+    border-color: var(--success);
+    box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.1);
 }
 .tool-card-header {
     display: flex; align-items: center; gap: 8px;
@@ -320,8 +334,17 @@ body {
     font-family: 'SF Mono', 'Cascadia Code', Consolas, monospace;
 }
 .tool-status { margin-left: auto; font-size: 11px; color: var(--text-muted); }
-.tool-status.done { color: var(--success); }
-.tool-status.running { color: var(--warning); animation: pulse 1s infinite; }
+.tool-status.done {
+    color: var(--success);
+    font-weight: 500;
+}
+.tool-status.running {
+    color: var(--warning);
+    font-weight: 500;
+    animation: pulse 1s infinite;
+}
+.tool-status.done::before { content: '✓ '; }
+.tool-status.running::before { content: '⏳ '; }
 
 @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
 
@@ -348,6 +371,31 @@ body {
 }
 .typing-dot:nth-child(2) { animation-delay: 0.2s; }
 .typing-dot:nth-child(3) { animation-delay: 0.4s; }
+
+/* Processing indicator — status line below tool cards */
+.processing-indicator {
+    font-size: 12px;
+    color: var(--primary);
+    padding: 8px 12px;
+    margin-top: 8px;
+    border-radius: 8px;
+    background: var(--primary-light);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    animation: fadeIn 0.2s ease;
+}
+
+.processing-indicator::before {
+    content: '';
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border: 2px solid var(--primary);
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
 
 @keyframes typingBounce {
     0%, 60%, 100% { transform: translateY(0); }
@@ -540,6 +588,24 @@ body {
     box-shadow: 0 0 0 3px var(--primary-light);
 }
 
+/* Save settings button */
+.btn-primary-save {
+    width: 100%;
+    padding: 10px 0;
+    background: var(--primary);
+    color: white;
+    border: none;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.2s, transform 0.1s;
+}
+.btn-primary-save:hover { background: #2563eb; transform: translateY(-1px); }
+.btn-primary-save:active { transform: translateY(0); }
+.btn-primary-save:disabled { opacity: 0.6; cursor: not-allowed; }
+.btn-primary-save.saved { background: var(--success); }
+
 .about-text { font-size: 14px; color: var(--text-secondary); margin-bottom: 4px; }
 
 /* ============ Scrollbar ============ */
@@ -719,5 +785,31 @@ body {
     padding: 12px;
     color: var(--text-muted);
     font-size: 12px;
+}
+
+/* ---- Toast notification ---- */
+.miniagent-toast {
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%) translateY(20px);
+    background: #1e293b;
+    color: #e2e8f0;
+    padding: 10px 24px;
+    border-radius: 8px;
+    font-size: 13px;
+    z-index: 9999;
+    opacity: 0;
+    transition: all 0.3s ease;
+    pointer-events: none;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+    max-width: 80vw;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.miniagent-toast.show {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
 }
 

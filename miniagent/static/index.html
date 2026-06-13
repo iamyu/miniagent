@@ -97,12 +97,6 @@
             <div class="view-container active" id="view-chat">
                 <div class="chat-header">
                     <h2 id="chat-title">新对话</h2>
-                    <div class="chat-header-status">
-                        <div class="processing-indicator" id="processing-indicator" style="display:none">
-                            <span class="processing-spinner"></span>
-                            <span class="processing-text" id="processing-text">处理中...</span>
-                        </div>
-                    </div>
                     <div class="chat-actions">
                         <button class="action-btn" id="clear-chat" title="清空对话">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -111,10 +105,6 @@
                             </svg>
                         </button>
                     </div>
-                </div>
-
-                <div class="progress-bar-container" id="progress-bar-container" style="display:none">
-                    <div class="progress-bar"></div>
                 </div>
 
                 <div class="chat-messages" id="chat-messages">
@@ -212,6 +202,9 @@
                             <label>Max Tokens</label>
                             <input type="number" id="setting-max-tokens" min="256" max="32768" step="256" placeholder="4096">
                         </div>
+                    </div>
+                    <div class="settings-section">
+                        <button id="btn-save-settings" class="btn-primary-save">保存设置</button>
                     </div>
                     <div class="settings-section">
                         <h3>关于</h3>

@@ -11,7 +11,7 @@ DEFAULT_CONFIG = {
     "api_key": "",
     "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     "temperature": 0.7,
-    "max_tokens": 4096,
+    "max_tokens": 32768,
     "max_history": 20,
     "system_prompt": "你是一个有帮助的 AI 助手。请用中文回答问题。",
     "skills_dir": None,
@@ -45,6 +45,16 @@ def load_config(project_config: Path | None = None) -> dict[str, Any]:
     if user_config.exists():
         with open(user_config, "r", encoding="utf-8") as f:
             user_data = json.load(f)
+
+        # Auto-upgrade: if saved max_tokens is below the current default, bump it
+        saved_tokens = user_data.get("max_tokens", None)
+        if saved_tokens is not None and saved_tokens < DEFAULT_CONFIG["max_tokens"]:
+            import logging
+            logging.getLogger("miniagent").info(
+                f"[config] Auto-upgrading max_tokens: {saved_tokens} -> {DEFAULT_CONFIG['max_tokens']}"
+            )
+            user_data["max_tokens"] = DEFAULT_CONFIG["max_tokens"]
+
         config.update(user_data)
 
     # Project-level config

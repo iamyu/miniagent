@@ -11,7 +11,7 @@ from .config import load_config
 from .skills import Skill, SkillsLoader
 from .tools import ToolRegistry, create_default_tools
 from .database import HistoryDB
-from .utils import sanitize_tool_arguments, log_api_error, logger
+from .utils import sanitize_tool_arguments, validate_tool_args, log_api_error, logger
 
 
 class ChatEngine:
@@ -160,16 +160,31 @@ class ChatEngine:
         self._tool_calls_count = 0
         tool_definitions = self.tools.get_definitions()
 
+        # Track consecutive failures to break infinite retry loops
+        _consecutive_failures: dict[str, int] = {}
+        _MAX_CONSECUTIVE_FAILURES = 3
+
         while self._tool_calls_count < self._max_tool_rounds:
             # Call LLM
             kwargs: dict[str, Any] = {
                 "model": self.config.get("model", "qwen-plus"),
                 "messages": messages,
                 "temperature": self.config.get("temperature", 0.7),
-                "max_tokens": self.config.get("max_tokens", 4096),
+                "max_tokens": self.config.get("max_tokens", 32768),
             }
             if tool_definitions:
                 kwargs["tools"] = tool_definitions
+
+            # Debug log: show what's being sent to the LLM
+            msg_preview = messages[-1].get("content", "") if messages else ""
+            logger.debug(
+                f"[chat] round={self._tool_calls_count}, model={kwargs['model']}, "
+                f"max_tokens={kwargs['max_tokens']}, temp={kwargs['temperature']}, "
+                f"msg_count={len(messages)}, tools={len(tool_definitions)}"
+            )
+            logger.debug(
+                f"[chat] last_msg_preview={msg_preview[:300]}"
+            )
 
             try:
                 resp = self.client.chat.completions.create(**kwargs)
@@ -209,10 +224,16 @@ class ChatEngine:
                 self._update_history(user_input, response_text)
                 return response_text
 
-            # Execute tool calls
-            for tool_call in message.tool_calls:
+            # Execute tool calls (use sanitized args from assistant_msg)
+            sanitized_calls = assistant_msg.get("tool_calls", [])
+            for i, tool_call in enumerate(message.tool_calls):
                 fn_name = tool_call.function.name
-                fn_args_str = tool_call.function.arguments or "{}"
+
+                # Prefer sanitized arguments from assistant_msg
+                if i < len(sanitized_calls):
+                    fn_args_str = sanitized_calls[i]["function"]["arguments"]
+                else:
+                    fn_args_str = tool_call.function.arguments or "{}"
 
                 # Parse arguments
                 try:
@@ -222,6 +243,28 @@ class ChatEngine:
                 except json.JSONDecodeError:
                     fn_args = {}
 
+                # Validate arguments before execution
+                is_valid, validation_msg = validate_tool_args(fn_name, fn_args)
+                if not is_valid:
+                    _consecutive_failures[fn_name] = _consecutive_failures.get(fn_name, 0) + 1
+                    logger.warning(
+                        f"[chat] Tool '{fn_name}' args validation failed: {validation_msg}. "
+                        f"consecutive_failures={_consecutive_failures[fn_name]}"
+                    )
+                    if _consecutive_failures.get(fn_name, 0) >= _MAX_CONSECUTIVE_FAILURES:
+                        logger.error(
+                            f"[chat] Tool '{fn_name}' has failed {_consecutive_failures[fn_name]} "
+                            f"times consecutively. Breaking tool loop."
+                        )
+                        response_text = (
+                            f"工具 {fn_name} 连续失败 {_consecutive_failures[fn_name]} 次，"
+                            f"已中止执行。请重试或简化请求。"
+                        )
+                        self._update_history(user_input, response_text)
+                        return response_text
+                    # Still execute with empty args to give feedback to LLM
+                    fn_args = {}
+
                 # Log tool call
                 arg_preview = ", ".join(f"{k}={repr(v)[:60]}" for k, v in fn_args.items())
                 print(f"  [Tool: {fn_name}({arg_preview})]")
@@ -229,6 +272,30 @@ class ChatEngine:
                 # Execute
                 result = self.tools.execute(fn_name, fn_args)
                 self._tool_calls_count += 1
+
+                # Track consecutive failures
+                if "Error" in result or "失败" in result:
+                    _consecutive_failures[fn_name] = _consecutive_failures.get(fn_name, 0) + 1
+                    logger.warning(
+                        f"[chat] Tool '{fn_name}' failed (consecutive={_consecutive_failures[fn_name]}): "
+                        f"result={result[:200]}"
+                    )
+                    if _consecutive_failures.get(fn_name, 0) >= _MAX_CONSECUTIVE_FAILURES:
+                        logger.error(
+                            f"[chat] Tool '{fn_name}' has failed {_consecutive_failures[fn_name]} "
+                            f"times consecutively. Breaking tool loop."
+                        )
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": (
+                                f"Error: Tool '{fn_name}' has failed "
+                                f"{_consecutive_failures[fn_name]} times. STOP calling this tool."
+                            ),
+                        })
+                        # Continue to next round — LLM will see the error and should stop
+                else:
+                    _consecutive_failures.pop(fn_name, None)
 
                 # Log result (truncated)
                 if len(result) > 200:

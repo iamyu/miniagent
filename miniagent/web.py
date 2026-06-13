@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from typing import Any
+
+import httpx
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,10 +16,127 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from .chat import ChatEngine
-from .config import load_config, get_config_path, get_app_dir
+from .config import load_config, save_config as persist_config, get_config_path, get_app_dir
 from .skills import Skill
-from .utils import sanitize_tool_arguments, log_api_error, logger
+from .utils import sanitize_tool_arguments, validate_tool_args, log_api_error, logger
 from openai import AsyncOpenAI
+
+
+# ---------------------------------------------------------------------------
+# WS Safe Send Helper
+# ---------------------------------------------------------------------------
+
+async def _ws_safe_send(ws: WebSocket, data: dict) -> bool:
+    """Safely send JSON data via WebSocket.
+
+    Returns True if send succeeded, False if connection is closed.
+    Callers should check the return value and stop processing on False.
+    """
+    try:
+        await ws.send_json(data)
+        return True
+    except Exception:
+        return False
+
+
+async def _check_ws_alive(ws: WebSocket) -> bool:
+    """Check if WebSocket connection is still alive.
+
+    Uses FastAPI's client_state to detect disconnection.
+    Returns False if the client has disconnected.
+    """
+    try:
+        from starlette.websockets import WebSocketState
+        return ws.client_state == WebSocketState.CONNECTED
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Tool Arguments Validation
+# ---------------------------------------------------------------------------
+
+def _filter_valid_tool_calls(
+    tool_calls_data: dict[int, dict],
+    consecutive_failures: dict[str, int],
+    max_consecutive_failures: int = 3,
+) -> list[dict]:
+    """Filter and validate collected tool calls.
+
+    Sanitizes arguments, validates JSON parse and content completeness.
+    Tracks consecutive failures per tool name to break infinite retry loops.
+
+    Args:
+        tool_calls_data: Raw accumulated tool call data from streaming.
+        consecutive_failures: Dict tracking consecutive failures per tool name (mutated).
+        max_consecutive_failures: Max allowed consecutive failures before rejecting.
+
+    Returns:
+        List of valid tool call dicts, each with keys:
+            data, sanitized_args, parsed_args, sanitized_args_str
+    """
+    valid: list[dict] = []
+
+    for idx in sorted(tool_calls_data.keys()):
+        tc = tool_calls_data[idx]
+        args_raw = tc.get("arguments", "")
+        name = tc.get("name", "unknown")
+
+        # Check for accumulated consecutive failures
+        fail_count = consecutive_failures.get(name, 0)
+        if fail_count >= max_consecutive_failures:
+            logger.warning(
+                f"[ws_stream] Tool '{name}' has failed {fail_count} times "
+                f"consecutively (max={max_consecutive_failures}), skipping"
+            )
+            continue
+
+        # Sanitize and parse JSON
+        sanitized = sanitize_tool_arguments(args_raw, name)
+        try:
+            parsed = json.loads(sanitized)
+            if not isinstance(parsed, dict):
+                parsed = {}
+        except json.JSONDecodeError:
+            logger.error(
+                f"[ws_stream] Tool '{name}' args parse FAILED even after "
+                f"sanitize: raw_len={len(args_raw)}, raw_preview={args_raw[:200]}"
+            )
+            consecutive_failures[name] = consecutive_failures.get(name, 0) + 1
+            continue
+
+        # Validate argument completeness (shared utility from utils.py)
+        is_valid, msg = validate_tool_args(name, parsed)
+        if not is_valid:
+            logger.warning(
+                f"[ws_stream] Tool '{name}' args validation FAILED: {msg}. "
+                f"content_len={len(parsed.get('content', '') or '')}"
+            )
+            consecutive_failures[name] = consecutive_failures.get(name, 0) + 1
+            continue
+
+        # Success: reset failure counter
+        consecutive_failures.pop(name, None)
+
+        valid.append({
+            "data": tc,
+            "sanitized_args": sanitized,
+            "parsed_args": parsed,
+        })
+
+    return valid
+
+
+def _track_tool_failure(tool_name: str, result: str, consecutive_failures: dict[str, int]) -> None:
+    """Update consecutive failure tracking based on tool result."""
+    if "Error" in result or "失败" in result:
+        consecutive_failures[tool_name] = consecutive_failures.get(tool_name, 0) + 1
+        logger.warning(
+            f"[ws_tool] Tool '{tool_name}' failed (consecutive={consecutive_failures[tool_name]}): "
+            f"result={result[:200]}"
+        )
+    else:
+        consecutive_failures.pop(tool_name, None)
 
 
 # ---------------------------------------------------------------------------
@@ -65,10 +185,71 @@ async def api_config():
         "model": cfg.get("model", "qwen-plus"),
         "base_url": cfg.get("base_url", ""),
         "temperature": cfg.get("temperature", 0.7),
-        "max_tokens": cfg.get("max_tokens", 4096),
+        "max_tokens": cfg.get("max_tokens", 32768),
         "max_history": cfg.get("max_history", 20),
         "has_api_key": bool(cfg.get("api_key")),
     }
+
+
+@app.post("/api/config")
+async def api_save_config(data: dict[str, Any]):
+    """Save configuration values to user-level config file."""
+    allowed_keys = {"model", "base_url", "temperature", "max_tokens", "max_history", "api_key"}
+    update = {k: v for k, v in data.items() if k in allowed_keys}
+
+    if "max_tokens" in update:
+        try:
+            update["max_tokens"] = int(update["max_tokens"])
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "max_tokens 必须为整数"}
+
+    if "temperature" in update:
+        try:
+            update["temperature"] = float(update["temperature"])
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "temperature 必须为数字"}
+
+    if not update:
+        return {"ok": False, "error": "没有有效的配置项"}
+
+    # Merge with existing config (preserve keys not in update)
+    existing = load_config()
+    existing.update(update)
+    persist_config(existing)
+
+    # Reset engine so next request picks up new config
+    _reset_engine()
+
+    logger.info(f"[config] saved: {json.dumps({k: v for k, v in update.items() if k != 'api_key'}, ensure_ascii=False)}")
+    return {"ok": True}
+
+
+@app.post("/api/open-file")
+async def api_open_file(data: dict[str, Any]):
+    """Open a local file with the OS default application."""
+    import os
+    import subprocess
+    import platform
+
+    filepath = data.get("path", "")
+    if not filepath:
+        return {"ok": False, "error": "缺少 path 参数"}
+
+    path = Path(filepath)
+    if not path.exists():
+        return {"ok": False, "error": f"文件不存在: {filepath}"}
+
+    try:
+        system = platform.system()
+        if system == "Windows":
+            os.startfile(str(path))
+        elif system == "Darwin":
+            subprocess.Popen(["open", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/api/tools")
@@ -211,62 +392,91 @@ async def ws_chat(ws: WebSocket):
     await ws.accept()
 
     engine = get_engine()
+    ws_connected = True  # Track connection state for this session
 
     try:
-        while True:
-            data = await ws.receive_text()
-            msg = json.loads(data)
+        while ws_connected:
+            # Receive message with timeout to detect stale connections
+            try:
+                data = await asyncio.wait_for(ws.receive_text(), timeout=300)
+            except asyncio.TimeoutError:
+                # No message for 5 min — connection is stale, close gracefully
+                logger.info("[WS] No message received for 300s, closing idle connection")
+                break
+
+            try:
+                msg = json.loads(data)
+            except json.JSONDecodeError:
+                await _ws_safe_send(ws, {"type": "error", "content": "Invalid JSON message"})
+                continue
+
             user_input = msg.get("message", "").strip()
 
             if not user_input:
-                await ws.send_json({"type": "error", "content": "message is required"})
+                await _ws_safe_send(ws, {"type": "error", "content": "message is required"})
                 continue
 
             # Handle commands
             if user_input.startswith("/"):
                 cmd_result = _handle_command(engine, user_input)
-                await ws.send_json(cmd_result)
+                await _ws_safe_send(ws, cmd_result)
                 continue
 
             # Stream the chat response
             try:
                 await _stream_chat(engine, ws, user_input)
             except WebSocketDisconnect:
+                ws_connected = False
                 raise
             except Exception as e:
-                print(f"[WS] Error in _stream_chat: {e}")
+                logger.error(f"[WS] Error in _stream_chat: {e}")
+                ws_connected = False
                 try:
                     await ws.send_json({"type": "error", "content": str(e)})
                 except Exception:
                     break
 
     except WebSocketDisconnect:
-        pass
+        logger.info("[WS] Client disconnected")
     except Exception as e:
-        print(f"[WS] Unexpected error: {e}")
+        logger.error(f"[WS] Unexpected error: {e}")
+    finally:
+        # Cleanup: ensure any pending state is cleared
+        logger.info("[WS] Connection closed")
 
 
 async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
-    """Stream a chat response via WebSocket, sending tool calls in real-time.
+    """Stream a chat response via WebSocket with tool call execution.
 
-    Uses AsyncOpenAI to avoid blocking the event loop during streaming.
+    Architecture:
+      1. Phase 1 (collect): All streaming chunks appended to memory buffers.
+         Text → frontend in real-time; tool args → accumulated locally.
+      2. Phase 2 (validate): After stream ends, parse & validate tool arguments.
+         Incomplete/truncated args are rejected with error feedback.
+      3. Phase 3 (execute): Only validated tools execute serially.
+         File writes are never triggered with incomplete content.
+
+    Fault tolerance:
+      - Connection state checked before every ws.send_json().
+      - On disconnect: stop chunk collection, clear buffer, return immediately.
+      - Consecutive tool failures tracked; same tool rejected after N failures.
+      - API errors return immediately (no retry loop).
     """
-    # Match skills
-    matched_skills = []
+    # --- Skill matching & system prompt ---
+    matched_skills: list[Skill] = []
     auto_matched = engine.skills.match_triggers(user_input)
     matched_skills.extend(auto_matched)
 
     system_prompt = engine.build_system_prompt(matched_skills)
 
-    # Send skill activation notification
     if matched_skills:
         names = [s.name for s in matched_skills]
-        await ws.send_json({
+        await _ws_safe_send(ws, {
             "type": "status",
             "content": f"Skills: {', '.join(names)}"
         })
 
-    # Build messages for API call
+    # --- Build messages for API ---
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
     messages.extend(engine.history)
     messages.append({"role": "user", "content": user_input})
@@ -275,10 +485,16 @@ async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
     tool_rounds = 0
     max_rounds = 30
 
-    # Create async OpenAI client (lightweight, per-request is fine)
+    # Track consecutive failures per tool name to break infinite retry loops
+    consecutive_failures: dict[str, int] = {}
+    MAX_CONSECUTIVE_FAILURES = 3
+
+    # --- Async HTTP client ---
+    _http_timeout = httpx.Timeout(30.0, connect=30.0, read=600.0, write=30.0, pool=10.0)
     async_client = AsyncOpenAI(
         api_key=engine.config.get("api_key", ""),
         base_url=engine.config.get("base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        http_client=httpx.AsyncClient(timeout=_http_timeout),
     )
 
     while tool_rounds < max_rounds:
@@ -286,146 +502,316 @@ async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
             "model": engine.config.get("model", "qwen-plus"),
             "messages": messages,
             "temperature": engine.config.get("temperature", 0.7),
-            "max_tokens": engine.config.get("max_tokens", 4096),
+            "max_tokens": engine.config.get("max_tokens", 32768),
             "stream": True,
         }
         if tool_definitions:
             kwargs["tools"] = tool_definitions
 
+        msg_preview = messages[-1].get("content", "") if messages else ""
+        logger.debug(
+            f"[ws_stream] round={tool_rounds}, model={kwargs['model']}, "
+            f"max_tokens={kwargs['max_tokens']}, temp={kwargs['temperature']}, "
+            f"msg_count={len(messages)}, tools={len(tool_definitions)}"
+        )
+        logger.debug(f"[ws_stream] last_msg_preview={msg_preview[:300]}")
+
+        # ================================================================
+        # Phase 1: Collect streaming data into memory buffers
+        # ================================================================
         try:
-            # Use AsyncOpenAI — async for properly yields to event loop
             stream = await async_client.chat.completions.create(**kwargs)
-
-            # Collect streamed content (non-blocking)
-            content_parts = []
-            tool_calls_data: dict[int, dict] = {}  # index -> tool call data
-            finish_reason = None
-
-            async for chunk in stream:
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
-
-                # Text content
-                if delta.content:
-                    content_parts.append(delta.content)
-                    # Send text chunk to client
-                    await ws.send_json({
-                        "type": "text",
-                        "content": delta.content,
-                    })
-
-                # Tool calls (streamed incrementally)
-                if delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        idx = tc.index
-                        if idx not in tool_calls_data:
-                            tool_calls_data[idx] = {
-                                "id": tc.id or "",
-                                "name": "",
-                                "arguments": "",
-                            }
-                        if tc.id:
-                            tool_calls_data[idx]["id"] = tc.id
-                        if tc.function:
-                            if tc.function.name:
-                                tool_calls_data[idx]["name"] = tc.function.name
-                            if tc.function.arguments:
-                                tool_calls_data[idx]["arguments"] += tc.function.arguments
-
-                if chunk.choices[0].finish_reason:
-                    finish_reason = chunk.choices[0].finish_reason
-
         except Exception as e:
-            # Log active tool call data before crash
-            if tool_calls_data:
-                logger.error(f"[ws_stream] tool_calls_data at crash: {json.dumps(tool_calls_data, ensure_ascii=False)[:1000]}")
-            error_text = log_api_error(e, "WS streaming API call", messages)
-            await ws.send_json({"type": "error", "content": f"API error: {e}"})
-            engine._update_history(user_input, error_text)
-            return
+            logger.error(
+                f"[ws_stream] API call failed at round={tool_rounds}: {e}. "
+                f"Stopping — no retry."
+            )
+            await _ws_safe_send(ws, {
+                "type": "error",
+                "content": f"API 调用失败: {e}"
+            })
+            return  # Stop immediately — don't re-enter the while loop
 
-        # Debug log: show collected tool call data
+        content_parts: list[str] = []       # Accumulated text chunks
+        tool_calls_data: dict[int, dict] = {}  # index → {id, name, arguments}
+        tool_name_notified: set[int] = set()   # track which tool_start events sent
+        finish_reason = None
+        chunk_count = 0
+        tool_chunk_count = 0
+
+        _last_chunk_time = time.time()
+        _last_chunk_log_time = 0.0  # For periodic chunk debug logging
+        _stream_aiter = stream.__aiter__()
+        _chunk_timeout = 120  # initial timeout between chunks
+        _stream_start_time = time.time()
+
+        # --- Stream iteration ---
+        logger.debug(f"[ws_stream] round={tool_rounds}, streaming started...")
+
+        while True:
+            # Check connection before reading next chunk
+            if not await _check_ws_alive(ws):
+                logger.warning("[ws_stream] Connection lost during streaming — aborting")
+                return
+
+            # Read next chunk with timeout
+            try:
+                chunk = await asyncio.wait_for(
+                    _stream_aiter.__anext__(),
+                    timeout=_chunk_timeout
+                )
+            except asyncio.TimeoutError:
+                elapsed = time.time() - _stream_start_time
+                logger.error(
+                    f"[ws_stream] round={tool_rounds}, NO chunk for {_chunk_timeout}s "
+                    f"(total elapsed={elapsed:.0f}s). Connection may be hung. "
+                    f"last_chunk={_last_chunk_time - _stream_start_time:.0f}s ago."
+                )
+                if elapsed > 360:
+                    logger.error(f"[ws_stream] Aborting after {elapsed:.0f}s total hang")
+                    break
+                _chunk_timeout = min(_chunk_timeout * 2, 300)
+                continue
+            except StopAsyncIteration:
+                break  # Stream ended normally
+
+            _last_chunk_time = time.time()
+            _chunk_timeout = 120  # Reset after successful chunk
+            chunk_count += 1
+
+            if not chunk.choices:
+                continue
+
+            delta = chunk.choices[0].delta
+            finish_reason = chunk.choices[0].finish_reason or finish_reason
+
+            # --- Text content: stream to frontend immediately ---
+            if delta.content:
+                content_parts.append(delta.content)
+                # Log chunks periodically (every 20th content chunk or every 5s)
+                now = time.time()
+                if chunk_count % 20 == 1 or now - _last_chunk_log_time > 5:
+                    total_text = sum(len(p) for p in content_parts)
+                    logger.debug(
+                        f"[ws_stream] round={tool_rounds}, chunk#{chunk_count}: "
+                        f"text_accum={total_text}, lat={now - _stream_start_time:.2f}s"
+                    )
+                    _last_chunk_log_time = now
+                if not await _ws_safe_send(ws, {
+                    "type": "text",
+                    "content": delta.content,
+                }):
+                    return  # Connection lost
+
+            # --- Tool calls: buffer locally (don't execute yet!) ---
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in tool_calls_data:
+                        tool_calls_data[idx] = {
+                            "id": tc.id or "",
+                            "name": "",
+                            "arguments": "",
+                        }
+                    if tc.id:
+                        tool_calls_data[idx]["id"] = tc.id
+                    if tc.function:
+                        if tc.function.name:
+                            tool_calls_data[idx]["name"] = tc.function.name
+                            if idx not in tool_name_notified:
+                                tool_name_notified.add(idx)
+                                logger.debug(
+                                    f"[ws_stream] round={tool_rounds}, "
+                                    f"tool_call[{idx}]: name={tc.function.name}"
+                                )
+                                if not await _ws_safe_send(ws, {
+                                    "type": "tool_start",
+                                    "name": tc.function.name,
+                                    "index": idx,
+                                    "args": "",
+                                }):
+                                    return
+                        if tc.function.arguments:
+                            tool_chunk_count += 1
+                            chunk_text = tc.function.arguments
+                            tool_calls_data[idx]["arguments"] += chunk_text
+                            # Log tool arg chunks periodically (every 10th)
+                            if tool_chunk_count % 10 == 1:
+                                acc_len = len(tool_calls_data[idx]["arguments"])
+                                logger.debug(
+                                    f"[ws_stream] round={tool_rounds}, "
+                                    f"tool_arg[{idx}] {tc.function.name}: "
+                                    f"chunk#{tool_chunk_count}, args_accum={acc_len}"
+                                )
+                            # Stream to frontend for live display
+                            if not await _ws_safe_send(ws, {
+                                "type": "tool_args",
+                                "index": idx,
+                                "content": chunk_text,
+                            }):
+                                return
+
+        # --- Stream statistics ---
+        total_tc_args = sum(len(v["arguments"]) for v in tool_calls_data.values())
+        logger.debug(
+            f"[ws_stream] round={tool_rounds}, streaming done — "
+            f"chunks={chunk_count}, text_len={sum(len(p) for p in content_parts)}, "
+            f"tool_call_args_len={total_tc_args}, finish_reason={finish_reason}"
+        )
+
+        # Stream ended without finish_reason → may be truncated
+        if not finish_reason:
+            logger.warning(
+                f"[ws_stream] round={tool_rounds}: stream ended without finish_reason. "
+                f"Collected data may be incomplete."
+            )
+
+        # Stream ended with 'length' → model hit max_tokens limit, content may be truncated
+        if finish_reason == "length":
+            logger.warning(
+                f"[ws_stream] round={tool_rounds}: finish_reason='length'. "
+                f"Model output hit max_tokens limit — content may be truncated. "
+                f"Consider increasing max_tokens (current={kwargs['max_tokens']})."
+            )
+
+        # ================================================================
+        # Phase 2: Validate collected tool arguments
+        # ================================================================
+        full_content = "".join(content_parts)
+
+        # ---- Debug: save raw LLM response to log file ----
+        try:
+            log_dir = get_app_dir() / "debug"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            log_file = log_dir / f"llm_response_{ts}.log"
+            tc_names = {k: v['name'] for k, v in tool_calls_data.items()}
+            lines = [
+                f"# round={tool_rounds}, model={kwargs['model']}, max_tokens={kwargs['max_tokens']}",
+                f"# timestamp={time.strftime('%Y-%m-%d %H:%M:%S')}",
+                "=" * 60,
+                full_content,
+                "=" * 60,
+                f"# tool_calls: {json.dumps(tc_names, ensure_ascii=False)}",
+            ]
+            log_file.write_text("\n".join(lines), encoding="utf-8")
+            logger.debug(f"[ws_stream] LLM raw response saved to: {log_file}")
+        except Exception as e:
+            logger.error(f"[ws_stream] Failed to save LLM response log: {e}")
+
         if tool_calls_data:
             logger.debug(
                 f"[ws_stream] round={tool_rounds}, tool_calls="
                 f"{json.dumps({k: {'name': v['name'], 'args_preview': v['arguments'][:200]} for k, v in tool_calls_data.items()}, ensure_ascii=False)}"
             )
 
-        # Build assistant message
-        full_content = "".join(content_parts)
+        # Filter: only keep tools with valid, complete arguments
+        valid_tools = _filter_valid_tool_calls(
+            tool_calls_data,
+            consecutive_failures,
+            MAX_CONSECUTIVE_FAILURES,
+        )
+
+        rejected_count = len(tool_calls_data) - len(valid_tools)
+        if rejected_count > 0:
+            logger.warning(
+                f"[ws_stream] round={tool_rounds}: rejected {rejected_count} tool calls "
+                f"due to incomplete/invalid arguments"
+            )
+            # Notify frontend about rejected tools
+            await _ws_safe_send(ws, {
+                "type": "status",
+                "content": (
+                    f"⚠ {rejected_count} 个工具调用因参数不完整被跳过"
+                    if tool_rounds == 0 else ""
+                ),
+            })
+
+        # --- Build assistant message ---
         assistant_msg: dict[str, Any] = {"role": "assistant", "content": full_content}
 
-        if tool_calls_data:
-            ordered_calls = [tool_calls_data[i] for i in sorted(tool_calls_data.keys())]
+        if valid_tools:
             assistant_msg["tool_calls"] = [
                 {
-                    "id": tc["id"],
+                    "id": tc["data"]["id"],
                     "type": "function",
                     "function": {
-                        "name": tc["name"],
-                        "arguments": sanitize_tool_arguments(
-                            tc["arguments"],
-                            tc["name"],
-                        ),
+                        "name": tc["data"]["name"],
+                        "arguments": tc["sanitized_args"],
                     },
                 }
-                for tc in ordered_calls
+                for tc in valid_tools
             ]
         messages.append(assistant_msg)
 
-        # No tool calls -> done
+        # No tool calls at all → done
         if not tool_calls_data:
-            await ws.send_json({"type": "done"})
+            await _ws_safe_send(ws, {"type": "done"})
             engine._update_history(user_input, full_content)
             return
 
-        # Execute tool calls
-        for tc_data in ordered_calls:
-            fn_name = tc_data["name"]
-            fn_args_str = tc_data["arguments"] or "{}"
+        # All tool calls rejected → send error and stop (don't let model retry)
+        if tool_calls_data and not valid_tools:
+            error_msg = (
+                "工具调用参数不完整，可能是流式输出被截断。"
+                "请尝试：1) 增大 max_tokens 设置；2) 简化请求内容；3) 重试。"
+            )
+            logger.error(
+                f"[ws_stream] All {len(tool_calls_data)} tool calls rejected. "
+                f"Stopping to prevent infinite retry."
+            )
+            await _ws_safe_send(ws, {"type": "error", "content": error_msg})
+            return
 
-            try:
-                fn_args = json.loads(fn_args_str)
-                if not isinstance(fn_args, dict):
-                    fn_args = {}
-            except json.JSONDecodeError:
-                logger.warning(
-                    f"[ws_tool] JSON decode failed for '{fn_name}', "
-                    f"raw={fn_args_str[:200]}"
-                )
-                fn_args = {}
+        # ================================================================
+        # Phase 3: Execute validated tools (serial, one at a time)
+        # ================================================================
+        for i, tc in enumerate(valid_tools):
+            # Check connection before each tool execution
+            if not await _check_ws_alive(ws):
+                logger.warning("[ws_stream] Connection lost before tool execution")
+                return
 
-            # Notify client about tool call
-            await ws.send_json({
-                "type": "tool_start",
-                "name": fn_name,
-                "args": fn_args,
+            fn_name = tc["data"]["name"]
+            fn_args = tc["parsed_args"]
+
+            # Notify frontend
+            await _ws_safe_send(ws, {
+                "type": "processing",
+                "content": f"正在执行: {fn_name}..."
             })
 
-            # Execute tool (run in thread to avoid blocking event loop)
+            # Execute tool (in thread to avoid blocking event loop)
             result = await asyncio.to_thread(engine.tools.execute, fn_name, fn_args)
             tool_rounds += 1
 
-            # Notify client about tool result
-            await ws.send_json({
+            # Track consecutive failures to break infinite retry loops
+            _track_tool_failure(fn_name, result, consecutive_failures)
+
+            # Notify client about result
+            await _ws_safe_send(ws, {
                 "type": "tool_end",
                 "name": fn_name,
+                "index": i,
                 "result": result[:500] if len(result) > 500 else result,
                 "truncated": len(result) > 500,
             })
 
-            # Add to messages
+            # Add tool result to message history
             messages.append({
                 "role": "tool",
-                "tool_call_id": tc_data["id"],
+                "tool_call_id": tc["data"]["id"],
                 "content": result,
             })
 
-    # Exceeded max rounds
-    warning = "[Notice] Reached maximum tool call rounds."
-    await ws.send_json({"type": "text", "content": warning})
-    await ws.send_json({"type": "done"})
+    # --- Exceeded max tool rounds ---
+    warning = (
+        f"[Notice] 已达到最大工具调用轮次 ({max_rounds})。"
+        f"请尝试简化请求或拆分任务。"
+    )
+    logger.warning(f"[ws_stream] max tool rounds ({max_rounds}) exceeded")
+    await _ws_safe_send(ws, {"type": "text", "content": warning})
+    await _ws_safe_send(ws, {"type": "done"})
     engine._update_history(user_input, warning)
 
 
