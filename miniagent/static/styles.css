@@ -261,6 +261,29 @@ body {
 .message-content a { color: var(--primary); text-decoration: none; }
 .message-content a:hover { text-decoration: underline; }
 
+/* Markdown tables */
+.message-content table {
+    width: 100%; border-collapse: collapse;
+    margin: 10px 0; font-size: 13px;
+}
+.message-content thead { background: #F3F4F6; }
+.message-content th {
+    padding: 8px 12px; text-align: left;
+    font-weight: 600; color: var(--text);
+    border-bottom: 2px solid var(--border);
+    white-space: nowrap;
+}
+.message-content td {
+    padding: 7px 12px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-secondary);
+    vertical-align: top;
+}
+.message-content tr:last-child td { border-bottom: none; }
+.message-content tbody tr:hover { background: #F9FAFB; }
+.message-content th:first-child, .message-content td:first-child { padding-left: 12px; }
+.message-content th:last-child, .message-content td:last-child { padding-right: 12px; }
+
 /* Clickable file path link */
 .file-link {
     display: inline-flex;

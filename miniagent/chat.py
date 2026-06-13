@@ -64,7 +64,9 @@ class ChatEngine:
                 "- Run Node.js / JavaScript scripts or inline code -> use run_node\n"
                 "- Run Python scripts or inline code -> use run_python\n"
                 "- Search the web -> use web_search\n"
-                "- Fetch web page content -> use web_fetch\n\n"
+                "- Fetch web page content -> use web_fetch\n"
+                "- Search locally installed skills -> use find_skills\n"
+                "- Activate a specific skill -> use use_skill\n\n"
                 "# Script Execution\n\n"
                 "Use run_node for JavaScript/Node.js and run_python for Python.\n"
                 "Both support: 'path' (script file) or 'code' (inline code), 'cwd' (working dir), 'timeout', 'args'.\n"
@@ -107,11 +109,40 @@ class ChatEngine:
         if summary:
             parts.append(
                 f"# Available Skills\n\n"
-                f"Auto-match and load relevant skills when user keywords match:\n\n"
+                f"Skills are knowledge/instruction packs that auto-activate when user keywords match. "
+                f"They are NOT tools — use the 'find_skills' tool to search skills and "
+                f"the 'use_skill' tool to explicitly load a skill's instructions.\n"
+                f"Available skills (auto-match by keywords):\n\n"
                 f"{summary}"
             )
 
         return "\n\n---\n\n".join(parts)
+
+    def _parse_at_commands(self, user_input: str) -> tuple[str, list[Skill]]:
+        """Parse @skill-name commands from user input.
+
+        Returns:
+            Tuple of (cleaned_input, list of activated Skill objects).
+            cleaned_input has @skill-name references removed.
+        """
+        import re
+        activated: list[Skill] = []
+        cleaned = user_input
+
+        # Match @skill-name patterns (skill names: letters, digits, hyphens)
+        at_pattern = re.compile(r'@([a-zA-Z][a-zA-Z0-9_-]*)')
+        for match in at_pattern.finditer(user_input):
+            skill_name = match.group(1)
+            skill = self.skills.get(skill_name)
+            if skill:
+                activated.append(skill)
+
+        # Remove @skill-name from the input (clean up extra spaces)
+        cleaned = at_pattern.sub('', cleaned).strip()
+        # Collapse multiple spaces
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+
+        return cleaned, activated
 
     def chat(
         self,
@@ -134,14 +165,20 @@ class ChatEngine:
         Returns:
             The assistant's final response text.
         """
+        # Parse @skill-name commands from input
+        cleaned_input, at_skills = self._parse_at_commands(user_input)
+
         # Match skills
         matched_skills = list(active_skills or [])
+        matched_skills.extend(at_skills)
         if auto_match:
-            auto_matched = self.skills.match_triggers(user_input)
-            auto_names = {s.name for s in auto_matched}
-            for s in matched_skills:
-                auto_names.discard(s.name)
-            matched_skills.extend([s for s in auto_matched if s.name in auto_names])
+            auto_matched = self.skills.match_triggers(cleaned_input)
+            # Deduplicate by name
+            existing_names = {s.name for s in matched_skills}
+            for s in auto_matched:
+                if s.name not in existing_names:
+                    matched_skills.append(s)
+                    existing_names.add(s.name)
 
         # Build system prompt
         system_prompt = self.build_system_prompt(matched_skills)
@@ -149,7 +186,7 @@ class ChatEngine:
         # Build messages
         messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
         messages.extend(self.history)
-        messages.append({"role": "user", "content": user_input})
+        messages.append({"role": "user", "content": cleaned_input if cleaned_input else user_input})
 
         # Log matched skills
         if matched_skills:

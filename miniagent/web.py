@@ -355,9 +355,23 @@ async def api_chat(body: dict[str, Any]):
     if not user_input:
         return {"error": "message is required"}
 
-    # Handle commands
+    # Handle slash commands
     if user_input.startswith("/"):
         return _handle_command(engine, user_input)
+
+    # Handle @skill-name commands
+    if user_input.startswith("@"):
+        cleaned, at_skills = engine._parse_at_commands(user_input)
+        if at_skills:
+            try:
+                response = await asyncio.to_thread(
+                    engine.chat, user_input,
+                    active_skills=at_skills,
+                    auto_match=True,
+                )
+                return {"response": response}
+            except Exception as e:
+                return {"error": str(e)}
 
     try:
         response = await asyncio.to_thread(engine.chat, user_input)
@@ -463,9 +477,17 @@ async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
       - API errors return immediately (no retry loop).
     """
     # --- Skill matching & system prompt ---
+    # Parse @skill-name commands from input
+    cleaned_input, at_skills = engine._parse_at_commands(user_input)
+
     matched_skills: list[Skill] = []
-    auto_matched = engine.skills.match_triggers(user_input)
-    matched_skills.extend(auto_matched)
+    matched_skills.extend(at_skills)
+    auto_matched = engine.skills.match_triggers(cleaned_input)
+    existing_names = {s.name for s in matched_skills}
+    for s in auto_matched:
+        if s.name not in existing_names:
+            matched_skills.append(s)
+            existing_names.add(s.name)
 
     system_prompt = engine.build_system_prompt(matched_skills)
 
@@ -479,7 +501,9 @@ async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
     # --- Build messages for API ---
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
     messages.extend(engine.history)
-    messages.append({"role": "user", "content": user_input})
+    # Use cleaned_input (with @skill-name removed) if non-empty, otherwise use original
+    llm_input = cleaned_input if cleaned_input else user_input
+    messages.append({"role": "user", "content": llm_input})
 
     tool_definitions = engine.tools.get_definitions()
     tool_rounds = 0
@@ -647,6 +671,7 @@ async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
                             if not await _ws_safe_send(ws, {
                                 "type": "tool_args",
                                 "index": idx,
+                                "name": tc.function.name,
                                 "content": chunk_text,
                             }):
                                 return

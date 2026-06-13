@@ -104,22 +104,40 @@ function handleWSMessage(msg) {
             result: null, done: false, truncated: false
         };
         state.currentAssistant.tools.push(toolEntry);
-        // Use msg.index if provided, otherwise fall back to array position
-        const cardIdx = msg.index !== undefined ? msg.index : state.currentAssistant.tools.length - 1;
+        // Always use last position in accumulated array (backend index resets each round)
+        const cardIdx = state.currentAssistant.tools.length - 1;
         console.debug(`[tool_start] name=${msg.name}, index=${cardIdx}, args_type=${typeof msg.args}`);
         appendToolCard(msg.name, msg.args, cardIdx);
         showProcessing('模型正在生成参数: ' + msg.name + '...');
     }
     else if (type === 'tool_args') {
         // Stream raw tool call arguments into the tool card in real-time
-        const idx = msg.index !== undefined ? msg.index : 0;
-        console.debug(`[tool_args] idx=${idx}, len=${msg.content?.length || 0}, preview=${(msg.content || '').substring(0, 60)}`);
+        // Use last non-done tool with matching name (backend index resets per round)
+        const tools = state.currentAssistant?.tools;
+        let idx = tools ? tools.length - 1 : 0;
+        if (tools && msg.name) {
+            for (let i = tools.length - 1; i >= 0; i--) {
+                if (tools[i].name === msg.name && !tools[i].done) { idx = i; break; }
+            }
+        }
         appendToolCardArgs(idx, msg.content);
     }
     else if (type === 'tool_end') {
         const tools = state.currentAssistant?.tools;
-        const idx = msg.index !== undefined ? msg.index : (tools ? tools.length - 1 : 0);
-        if (tools && idx < tools.length) {
+        // Find the last not-done tool with matching name (backend index resets per round)
+        let idx = -1;
+        if (tools) {
+            for (let i = tools.length - 1; i >= 0; i--) {
+                if (tools[i].name === msg.name && !tools[i].done) {
+                    idx = i;
+                    break;
+                }
+            }
+        }
+        if (idx < 0 && tools && tools.length > 0) {
+            idx = tools.length - 1;  // fallback
+        }
+        if (tools && idx >= 0 && idx < tools.length) {
             const tool = tools[idx];
             tool.result = msg.result;
             tool.truncated = msg.truncated;
@@ -483,11 +501,14 @@ function appendUserMessage(text) {
         <div class="message-content">${escapeHtml(text)}</div>
     `;
     container.appendChild(div);
-    scrollToBottom();
+    scrollToBottom(true);
 }
 
 function appendAssistantBubble() {
     removeWelcome();
+    // Reset streaming render state for new message
+    _lastRenderedLen = 0;
+    _renderScheduled = false;
     const container = document.getElementById('chat-messages');
     const div = document.createElement('div');
     div.className = 'message assistant';
@@ -507,14 +528,58 @@ function appendAssistantBubble() {
         </div>
     `;
     container.appendChild(div);
-    scrollToBottom();
+    scrollToBottom(true);
+}
+
+function isUserNearBottom() {
+    const container = document.getElementById('chat-messages');
+    if (!container) return true;
+    return container.scrollHeight - container.scrollTop - container.clientHeight <= 150;
+}
+
+// ---- Streaming render throttle ----
+// raw content length changed since last render
+let _lastRenderedLen = 0;
+// rAF throttle flag
+let _renderScheduled = false;
+
+/**
+ * Schedule a DOM render via requestAnimationFrame.
+ *
+ * Streaming text chunks can arrive at >100 Hz (e.g. every 5–10 ms).
+ * Calling formatMessageContent + innerHTML on every chunk causes
+ * quadratic DOM work for long messages.
+ *
+ * rAF throttling batches all chunks within one ~16ms frame into a
+ * single render, while still keeping the output visually smooth.
+ */
+function _scheduleBubbleRender(el) {
+    if (_renderScheduled) return;
+    _renderScheduled = true;
+    requestAnimationFrame(() => {
+        _renderScheduled = false;
+        const content = state.currentAssistant?.content || '';
+        // Skip if nothing rendered yet (typing indicator still showing)
+        if (!content) return;
+        // Skip if no new content since last render — avoid wasted work
+        // when multiple tool messages arrive but no text was added
+        if (content.length <= _lastRenderedLen) return;
+
+        const nearBottom = isUserNearBottom();
+        el.innerHTML = formatMessageContent(content);
+        _lastRenderedLen = content.length;
+        if (nearBottom) scrollToBottom(true);
+    });
 }
 
 function updateAssistantBubble(content) {
     const el = document.getElementById('current-assistant-text');
     if (el) {
-        el.innerHTML = formatMessageContent(content);
-        scrollToBottom();
+        _scheduleBubbleRender(el);
+    }
+    // Reset render tracker when a new message starts (content shorter = new message)
+    if (content.length < _lastRenderedLen) {
+        _lastRenderedLen = 0;
     }
 }
 
@@ -539,8 +604,10 @@ function appendToolCard(name, args, idx) {
             <div class="tool-args" id="tool-args-${idx}">${escapeHtml(argsStr)}</div>
         </div>
     `;
+    // Check BEFORE appending — only scroll if user hasn't scrolled up
+    const nearBottom = isUserNearBottom();
     container.appendChild(card);
-    scrollToBottom();
+    if (nearBottom) scrollToBottom(true);
 }
 
 // Stream args text into an existing tool card in real-time
@@ -553,12 +620,14 @@ function appendToolCardArgs(idx, chunk) {
     const current = argsEl.textContent || '';
     // Limit to 5000 chars to avoid DOM bloat with huge HTML
     if (current.length > 5000) return;
+    // Check BEFORE DOM mutation
+    const nearBottom = isUserNearBottom();
     argsEl.textContent = current + chunk;
     // Also track in state for later use (e.g., file preview)
     if (state.currentAssistant && state.currentAssistant.tools[idx]) {
         state.currentAssistant.tools[idx].args = (state.currentAssistant.tools[idx].args || '') + chunk;
     }
-    scrollToBottom();
+    if (nearBottom) scrollToBottom(true);
 }
 
 function updateToolCard(toolInfo, idx) {
@@ -615,7 +684,8 @@ function finalizeAssistantMessage() {
     state.isStreaming = false;
     hideProcessing();
     document.getElementById('send-btn').disabled = !document.getElementById('chat-input').value.trim();
-    scrollToBottom();
+    // If user scrolled up during response, don't yank them back to bottom
+    if (isUserNearBottom()) scrollToBottom(true);
 }
 
 function appendSystemMessage(text) {
@@ -628,43 +698,40 @@ function appendSystemMessage(text) {
         <div class="message-content">${formatMessageContent(text)}</div>
     `;
     container.appendChild(div);
-    scrollToBottom();
+    scrollToBottom(true);
 }
 
-// ============ Markdown Rendering ============
-function formatMessageContent(content) {
-    if (!content) return '';
+// ============ Markdown Rendering Pipeline ============
 
-    // ---- Step 0: Extract code blocks BEFORE any HTML stripping ----
-    // Code blocks may contain HTML that looks like LLM-generated tags.
-    const cbBlocks = [];
-    let clean = content.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
-        cbBlocks.push({ lang, code });
-        return `%%CB_${cbBlocks.length - 1}%%`;
+/**
+ * Extract fenced ```code blocks``` from content.
+ * Returns cleaned content with placeholders, and the extracted blocks.
+ */
+function _extractFencedBlocks(content) {
+    const blocks = [];
+    const clean = content.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+        blocks.push({ lang, code });
+        return `%%CB_${blocks.length - 1}%%`;
     });
+    return { clean, blocks };
+}
 
-    // ---- Step 1: Strip raw HTML tags the LLM might have generated ----
-    // The LLM sometimes wraps its reply in <p>, generates <a class="file-link">, etc.
-    // If we let them be escaped, &lt;a ...&gt; won't be caught by the anchor protection
-    // regex below, so the bare-path regex will match paths INSIDE escaped hrefs
-    // and create nested <a> tags.
-    clean = clean.replace(/<br\s*\/?>/gi, '\n');
-    clean = clean.replace(/<\/p>/gi, '\n').replace(/<p[^>]*>/gi, '');
-    clean = clean.replace(/<\/div>/gi, '\n').replace(/<div[^>]*>/gi, '');
-    // <a ...>...</a> — keep only the link text (we build proper links below)
-    clean = clean.replace(/<a\b[^>]*>(.*?)<\/a>/gi, '$1');
+/**
+ * Strip raw HTML tags that the LLM might accidentally generate.
+ */
+function _stripLlmHtml(content) {
+    let c = content;
+    c = c.replace(/<br\s*\/?>/gi, '\n');
+    c = c.replace(/<\/p>/gi, '\n').replace(/<p[^>]*>/gi, '');
+    c = c.replace(/<\/div>/gi, '\n').replace(/<div[^>]*>/gi, '');
+    c = c.replace(/<a\b[^>]*>(.*?)<\/a>/gi, '$1');
+    return c;
+}
 
-    // ---- Step 2: Escape + restore code blocks ----
-    let html = escapeHtml(clean);
-
-    // Restore code blocks (escape their content for <code> display)
-    html = html.replace(/%%CB_(\d+)%%/g, (_, i) => {
-        const b = cbBlocks[parseInt(i)];
-        return '```' + b.lang + '\n' + escapeHtml(b.code) + '```';
-    });
-
-    // ---- Step 3: Standard markdown processing ----
-    // Code blocks → styled HTML
+/**
+ * Convert fenced ``` code blocks to styled HTML with copy buttons.
+ */
+function _renderCodeBlocksToHtml(html) {
     const codeBlocks = [];
     html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
         const id = 'cb-' + Math.random().toString(36).substr(2, 6);
@@ -673,30 +740,30 @@ function formatMessageContent(content) {
         );
         return `%%CODEBLOCK_${codeBlocks.length - 1}%%`;
     });
+    return { html, codeBlocks };
+}
 
-    // Inline code
+/**
+ * Apply inline markdown: `code`, **bold**, [links](url).
+ */
+function _renderInlineMarkdown(html) {
     html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
-
-    // Bold
     html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-
-    // Markdown links [text](url)
     html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+    return html;
+}
 
-    // ---- File-path detection ----
-    // Only absolute paths (with drive letter e.g. "D:\...") get clickable
-    // file:// links. Relative paths (e.g. "report.html") are NOT converted
-    // because they can't be opened via the file:// protocol.
-    //
-    // Runs BEFORE anchor protection so any new <a> tags we create here
-    // are protected from the bare-path regex below.
+/**
+ * Convert absolute file paths to clickable <span> links.
+ * Only converts the first occurrence of each normalized path.
+ */
+function _renderFileLinks(html) {
     const linkedPaths = new Set();
 
     function _norm(p) {
         return p.replace(/\\/g, '/').replace(/\/{2,}/g, '/');
     }
-
-    function buildFileLink(path) {
+    function _buildLink(path) {
         const escaped = path.replace(/"/g, '&quot;');
         return `<span class="file-link" data-path="${escaped}" onclick="copyFilePath(this)" title="点击复制路径">${path}</span>`;
     }
@@ -707,7 +774,7 @@ function formatMessageContent(content) {
         if (isAbsPath) {
             if (linkedPaths.has(_norm(codeContent))) return `<code>${codeContent}</code>`;
             linkedPaths.add(_norm(codeContent));
-            return buildFileLink(codeContent);
+            return _buildLink(codeContent);
         }
         return `<code>${codeContent}</code>`;
     });
@@ -717,29 +784,128 @@ function formatMessageContent(content) {
     html = html.replace(fileExtRe, (match) => {
         if (linkedPaths.has(_norm(match))) return match;
         linkedPaths.add(_norm(match));
-        return buildFileLink(match);
+        return _buildLink(match);
     });
 
-    // ---- Anchor protection (AFTER all link creation) ----
-    // Wrap every <a> tag so subsequent processing can't break them.
-    const anchorPlaceholders = [];
+    return html;
+}
+
+/**
+ * Wrap all <a> tags in placeholders so subsequent processing won't break them.
+ */
+function _protectAnchors(html) {
+    const placeholders = [];
     html = html.replace(/<a\b[^>]*>.*?<\/a>/gi, (match) => {
-        const idx = anchorPlaceholders.length;
-        anchorPlaceholders.push(match);
+        const idx = placeholders.length;
+        placeholders.push(match);
         return `%%ANCHOR_${idx}%%`;
     });
+    return { html, placeholders };
+}
 
-    // Restore protected <a> tags
-    html = html.replace(/%%ANCHOR_(\d+)%%/g, (_, i) => anchorPlaceholders[parseInt(i)]);
-
-    // Restore code blocks
+/**
+ * Restore code block and anchor placeholders.
+ */
+function _restorePlaceholders(html, codeBlocks, anchors) {
+    html = html.replace(/%%ANCHOR_(\d+)%%/g, (_, i) => anchors[parseInt(i)]);
     html = html.replace(/%%CODEBLOCK_(\d+)%%/g, (_, i) => codeBlocks[parseInt(i)]);
+    return html;
+}
 
-    // Line breaks
+/**
+ * Extract markdown tables, replace with placeholders, return {html, tables}.
+ * Tables are multi-line: header row, separator row, one or more data rows.
+ */
+function _extractMarkdownTables(html) {
+    const tables = [];
+    // Match table blocks: consecutive lines of | ... | format
+    // Each line: starts with |, contains groups of non-pipe chars ending in |, optional trailing space
+    const tableRe = /(?:^\|(?:[^|\n]+\|)+\s*$\n?)+/gm;
+    html = html.replace(tableRe, (match) => {
+        const lines = match.trim().split(/\n/);
+        if (lines.length < 3) return match; // Need header + separator + ≥1 data row
+        // Verify second line is a separator (|---...|)
+        if (!/^\|[\s:-]+\|/.test(lines[1])) return match;
+        // Render table
+        let tableHtml = '<table><thead><tr>';
+        const headers = lines[0].split('|').filter(c => c.trim() !== '');
+        headers.forEach(h => { tableHtml += '<th>' + h.trim() + '</th>'; });
+        tableHtml += '</tr></thead><tbody>';
+        for (let i = 2; i < lines.length; i++) {
+            const cells = lines[i].split('|').filter(c => c.trim() !== '');
+            tableHtml += '<tr>';
+            cells.forEach(c => { tableHtml += '<td>' + c.trim() + '</td>'; });
+            tableHtml += '</tr>';
+        }
+        tableHtml += '</tbody></table>';
+        const idx = tables.length;
+        tables.push(tableHtml);
+        return '%%TBL_' + idx + '%%';
+    });
+    return { html, tables };
+}
+
+/**
+ * Convert newlines to paragraphs and line breaks.
+ * Protected content (placeholders) must already be extracted.
+ */
+function _assembleParagraphs(html) {
     html = html.replace(/\n\n+/g, '</p><p>');
     html = html.replace(/\n/g, '<br>');
     html = '<p>' + html + '</p>';
     html = html.replace(/<p>\s*<\/p>/g, '');
+    return html;
+}
+
+/**
+ * Convert LLM response text to rendered HTML.
+ *
+ * Pipeline:  extract code blocks → strip raw HTML → escape → restore blocks
+ *          → render code → inline markdown → file links → protect anchors
+ *          → restore placeholders → paragraphs.
+ */
+function formatMessageContent(content) {
+    if (!content) return '';
+
+    // Step 0–1: Extract fenced code blocks, strip LLM-generated raw HTML
+    const { clean: preCleaned, blocks: cbBlocks } = _extractFencedBlocks(content);
+    let clean = _stripLlmHtml(preCleaned);
+
+    // Step 2: HTML-escape then restore fenced blocks (their content is escaped later)
+    let html = escapeHtml(clean);
+    html = html.replace(/%%CB_(\d+)%%/g, (_, i) => {
+        const b = cbBlocks[parseInt(i)];
+        return '```' + b.lang + '\n' + escapeHtml(b.code) + '```';
+    });
+
+    // Step 3: Render code blocks to styled HTML with copy buttons
+    const rendered = _renderCodeBlocksToHtml(html);
+    const codeBlocks = rendered.codeBlocks;
+    html = rendered.html;
+
+    // Step 3.5: Extract markdown tables into placeholders (protect from paragraph breaking)
+    const tableData = _extractMarkdownTables(html);
+    html = tableData.html;
+    const tables = tableData.tables;
+
+    // Step 4: Inline markdown — `code`, **bold**, [links](url)
+    html = _renderInlineMarkdown(html);
+
+    // Step 5: Convert absolute file paths to clickable links
+    html = _renderFileLinks(html);
+
+    // Step 6: Protect <a> tags from being broken by subsequent processing
+    const result = _protectAnchors(html);
+    html = _restorePlaceholders(result.html, codeBlocks, result.placeholders);
+
+    // Step 7: Paragraphs and line breaks
+    html = _assembleParagraphs(html);
+
+    // Step 7.5: Unwrap table placeholders from <p> tags (browsers auto-close <p> before <table>)
+    html = html.replace(/<p>\s*%%TBL_(\d+)%%\s*<\/p>/g, '%%TBL_$1%%');
+
+    // Step 8: Restore table HTML
+    html = html.replace(/%%TBL_(\d+)%%/g, (_, i) => tables[parseInt(i)] || '');
 
     return html;
 }
@@ -893,9 +1059,16 @@ function removeWelcome() {
     if (welcome) welcome.remove();
 }
 
-function scrollToBottom() {
+function scrollToBottom(force = false) {
     requestAnimationFrame(() => {
         const container = document.getElementById('chat-messages');
+        if (!container) return;
+        // If the user has scrolled up (more than 150px from bottom), don't auto-scroll
+        // unless force=true (e.g., after appending a new user message or loading history)
+        if (!force) {
+            const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+            if (distanceFromBottom > 150) return;
+        }
         container.scrollTop = container.scrollHeight;
     });
 }
@@ -1121,7 +1294,7 @@ async function loadSession(sessionId) {
             }
         }
 
-        scrollToBottom();
+        scrollToBottom(true);
 
         // Update chat title
         const title = messages.find(m => m.role === 'user');

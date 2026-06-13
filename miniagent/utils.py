@@ -32,7 +32,7 @@ def sanitize_tool_arguments(arguments_str: str, tool_name: str = "unknown") -> s
         A valid JSON string (or "{}" if repair fails).
     """
     if not arguments_str or not arguments_str.strip():
-        logger.warning(f"[tool_args] empty arguments for tool '{tool_name}', defaulting to {{}}")
+        logger.warning("[tool_args] empty arguments for tool '%s', defaulting to {}", tool_name)
         return "{}"
 
     raw = arguments_str.strip()
@@ -51,7 +51,7 @@ def sanitize_tool_arguments(arguments_str: str, tool_name: str = "unknown") -> s
     if raw_fixed != raw:
         try:
             json.loads(raw_fixed)
-            logger.info(f"[tool_args] repaired arguments for '{tool_name}' by escaping newlines")
+            logger.info("[tool_args] repaired arguments for '%s' by escaping newlines", tool_name)
             return raw_fixed
         except json.JSONDecodeError:
             pass  # fall through to remaining fixes
@@ -72,8 +72,8 @@ def sanitize_tool_arguments(arguments_str: str, tool_name: str = "unknown") -> s
             if repaired and repaired != raw:
                 parsed = json.loads(repaired)
                 logger.info(
-                    f"[tool_args] repaired arguments for '{tool_name}' "
-                    f"(fix #{i+1}): raw={raw[:200]} -> repaired={repaired[:200]}"
+                    "[tool_args] repaired arguments for '%s' (fix #%d): raw=%.200s -> repaired=%.200s",
+                    tool_name, i + 1, raw, repaired
                 )
                 return json.dumps(parsed, ensure_ascii=False)
         except Exception:
@@ -81,8 +81,8 @@ def sanitize_tool_arguments(arguments_str: str, tool_name: str = "unknown") -> s
 
     # All repairs failed
     logger.error(
-        f"[tool_args] CRITICAL: cannot repair arguments for tool '{tool_name}'. "
-        f"raw={raw[:500]}"
+        "[tool_args] CRITICAL: cannot repair arguments for tool '%s'. raw=%.500s",
+        tool_name, raw
     )
     return "{}"
 
@@ -219,7 +219,7 @@ def log_api_error(error: Exception, context: str = "", messages: list | None = N
     Returns a user-friendly error string.
     """
     error_str = str(error)
-    logger.error(f"[api_error] {context}: {error_str}")
+    logger.error("[api_error] %s: %s", context, error_str)
 
     if messages:
         # Log the last few messages (truncated) for debugging
@@ -236,8 +236,9 @@ def log_api_error(error: Exception, context: str = "", messages: list | None = N
                         f"args={fn.get('arguments', '')[:100]}"
                         f")"
                     )
-                logger.debug(f"[api_error] msg[{i}]: role={role}, tool_calls=[{'; '.join(tc_info)}]")
+                tc_summary = '; '.join(tc_info)
+                logger.debug("[api_error] msg[%d]: role=%s, tool_calls=[%s]", i, role, tc_summary)
             else:
-                logger.debug(f"[api_error] msg[{i}]: role={role}, content={content[:200]}")
+                logger.debug("[api_error] msg[%d]: role=%s, content=%.200s", i, role, content)
 
     return f"API error: {error_str}"

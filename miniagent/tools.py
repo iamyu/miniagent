@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-import difflib
 import shutil
 import subprocess
 import tempfile
@@ -1298,6 +1297,204 @@ class SaveDocumentTool(Tool):
 
 
 # ---------------------------------------------------------------------------
+# Skill Tools
+# ---------------------------------------------------------------------------
+
+class FindSkillsTool(Tool):
+    """Search for locally installed skills by keyword."""
+
+    @staticmethod
+    def _get_skills_dir() -> Path:
+        """Get skills directory, respecting config override."""
+        from .config import load_config, get_app_dir
+        cfg = load_config()
+        if cfg.get("skills_dir"):
+            return Path(cfg["skills_dir"]).expanduser()
+        return get_app_dir() / "skills"
+
+    @property
+    def name(self) -> str:
+        return "find_skills"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Search locally installed skills by keyword query. "
+            "Returns matching skill names, descriptions, and triggers. "
+            "Use this to find skills that can help with a specific task."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Keyword to search for in skill names, descriptions, and triggers",
+                },
+            },
+            "required": ["query"],
+        }
+
+    def execute(self, query: str = "", **kw: Any) -> str:
+        if not query:
+            return "Error: query is required"
+
+        skills_dir = self._get_skills_dir()
+        if not skills_dir.exists():
+            return "No skills directory found. Create skills in ~/.miniagent/skills/<name>/SKILL.md"
+
+        try:
+            import yaml
+            query_lower = query.lower().strip()
+            results: list[dict] = []
+
+            for skill_dir in sorted(skills_dir.iterdir()):
+                if not skill_dir.is_dir():
+                    continue
+                skill_file = skill_dir / "SKILL.md"
+                if not skill_file.exists():
+                    continue
+
+                name = skill_dir.name
+                try:
+                    content = skill_file.read_text(encoding="utf-8")
+                except Exception:
+                    continue
+
+                # Parse frontmatter for metadata
+                description = name
+                triggers: list[str] = []
+                if content.startswith("---"):
+                    import re as _re
+                    fm_match = _re.match(
+                        r"^---\s*\r?\n(.*?)\r?\n---\s*\r?\n?",
+                        content, _re.DOTALL,
+                    )
+                    if fm_match:
+                        try:
+                            meta = yaml.safe_load(fm_match.group(1))
+                            if isinstance(meta, dict):
+                                description = str(meta.get("description", name))
+                                triggers = meta.get("triggers", [])
+                                if isinstance(triggers, str):
+                                    triggers = [triggers]
+                        except yaml.YAMLError:
+                            pass
+
+                # Search in name, description, triggers, and content
+                search_text = f"{name} {description} {' '.join(triggers)}".lower()
+                if query_lower in search_text or query_lower in content.lower():
+                    score = 0
+                    if query_lower in name.lower():
+                        score += 100
+                    if query_lower in description.lower():
+                        score += 50
+                    for t in triggers:
+                        if query_lower in t.lower():
+                            score += 30
+                    results.append({
+                        "name": name,
+                        "description": description,
+                        "triggers": triggers,
+                        "score": score,
+                    })
+
+            if not results:
+                return (
+                    f"No local skills found matching '{query}'.\n"
+                    f"Try broader keywords, or use /skills to see all available skills."
+                )
+
+            results.sort(key=lambda x: x["score"], reverse=True)
+
+            lines = [f"Found {len(results)} skill(s) matching '{query}':\n"]
+            for i, r in enumerate(results, 1):
+                trigger_str = f" [triggers: {', '.join(r['triggers'])}]" if r["triggers"] else ""
+                lines.append(
+                    f"{i}. **{r['name']}** — {r['description']}{trigger_str}"
+                )
+
+            lines.append("\nUse the 'use_skill' tool to activate a skill, or just mention keywords to auto-trigger.")
+            return "\n".join(lines)
+
+        except Exception as e:
+            return f"Error searching skills: {e}"
+
+
+class UseSkillTool(Tool):
+    """Explicitly activate a skill by name."""
+
+    @property
+    def name(self) -> str:
+        return "use_skill"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Explicitly activate a skill by name. Call this when you need to use "
+            "a specific skill's knowledge. The skill's instructions will be loaded "
+            "and applied to the current conversation."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Name of the skill to activate (e.g., 'prd-writer', 'html-ppt')",
+                },
+            },
+            "required": ["name"],
+        }
+
+    def execute(self, name: str = "", **kw: Any) -> str:
+        if not name:
+            return "Error: skill name is required"
+
+        # Access the skills loader through the global registry
+        skills_dir = FindSkillsTool._get_skills_dir()
+        if not skills_dir.exists():
+            return f"Skills directory not found: {skills_dir}"
+
+        skill_file = skills_dir / name / "SKILL.md"
+        if not skill_file.exists():
+            # Try to list all available skills
+            available = []
+            if skills_dir.exists():
+                for d in sorted(skills_dir.iterdir()):
+                    if d.is_dir() and (d / "SKILL.md").exists():
+                        available.append(d.name)
+            avail_str = ", ".join(available) if available else "none"
+            return (
+                f"Skill '{name}' not found.\n"
+                f"Available skills: {avail_str}\n"
+                f"Use 'find_skills' to search for relevant skills."
+            )
+
+        try:
+            content = skill_file.read_text(encoding="utf-8")
+            # Strip frontmatter
+            import re as _re
+            fm_re = _re.compile(r"^---\s*\r?\n(.*?)\r?\n---\s*\r?\n?", _re.DOTALL)
+            match = fm_re.match(content)
+            skill_content = content[match.end():].strip() if match else content.strip()
+
+            skill_root = skill_file.parent  # absolute path to the skill directory
+
+            return (
+                f"Skill '{name}' activated.\n"
+                f"Skill root directory (all relative paths below are relative to this): {skill_root}\n\n"
+                f"{skill_content}"
+            )
+        except Exception as e:
+            return f"Error loading skill '{name}': {e}"
+
+
+# ---------------------------------------------------------------------------
 # Default Tool Factory
 # ---------------------------------------------------------------------------
 
@@ -1314,4 +1511,6 @@ def create_default_tools() -> ToolRegistry:
     registry.register(SaveDocumentTool())
     registry.register(WebSearchTool())
     registry.register(WebFetchTool())
+    registry.register(FindSkillsTool())
+    registry.register(UseSkillTool())
     return registry
