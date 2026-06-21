@@ -396,6 +396,86 @@ async def api_reload_skills():
     return {"status": "ok", "count": len(engine.skills.list_all())}
 
 
+@app.get("/api/browse-files")
+async def api_browse_files(path: str = ""):
+    """Browse files within the project directory (MiniAgent root).
+    
+    Returns a directory tree for building a file picker UI.
+    Only allows browsing within the project root directory.
+    
+    Args:
+        path: Relative path within project root (empty = root)
+    """
+    import os as _os
+    
+    # Determine project root (d:\AI\miniagent\)
+    project_root = Path(__file__).resolve().parent.parent
+    
+    # Resolve the requested path relative to project root
+    if path:
+        # Normalize path separators and remove any leading slashes
+        clean_path = path.replace('\\', '/').strip('/')
+        target = (project_root / clean_path).resolve()
+    else:
+        target = project_root.resolve()
+    
+    # Security: ensure target is within project root
+    try:
+        target.relative_to(project_root.resolve())
+    except ValueError:
+        return {"error": "禁止访问项目目录以外的路径", "tree": []}
+    
+    if not target.exists() or not target.is_dir():
+        return {"error": "目录不存在", "tree": []}
+    
+    # Files/dirs to exclude from browsing
+    EXCLUDE_DIRS = {
+        '.git', '__pycache__', '.codebuddy', 'node_modules',
+        '.venv', 'venv', '.pytest_cache', '.mypy_cache',
+        '.egg-info', '.workbuddy',
+    }
+    EXCLUDE_FILES = {'.DS_Store', 'Thumbs.db', '.gitignore'}
+    
+    # Calculate relative path from project root (for display)
+    try:
+        rel_path = str(target.relative_to(project_root.resolve()))
+        if rel_path == '.':
+            rel_path = ''
+    except ValueError:
+        rel_path = ''
+    
+    items = []
+    try:
+        with _os.scandir(str(target)) as entries:
+            for entry in sorted(entries, key=lambda e: (not e.is_dir(), e.name.lower())):
+                if entry.name.startswith('.'):
+                    continue
+                if entry.is_dir():
+                    if entry.name in EXCLUDE_DIRS:
+                        continue
+                    items.append({
+                        "name": entry.name,
+                        "type": "dir",
+                        "path": _os.path.join(rel_path, entry.name).replace('\\', '/'),
+                    })
+                elif entry.is_file():
+                    if entry.name in EXCLUDE_FILES:
+                        continue
+                    items.append({
+                        "name": entry.name,
+                        "type": "file",
+                        "path": _os.path.join(rel_path, entry.name).replace('\\', '/'),
+                    })
+    except PermissionError:
+        return {"error": "无权限访问该目录", "tree": []}
+    
+    return {
+        "root": str(project_root),
+        "current_path": rel_path,
+        "tree": items,
+    }
+
+
 # ---------------------------------------------------------------------------
 # WebSocket Streaming Chat
 # ---------------------------------------------------------------------------
@@ -813,13 +893,16 @@ async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
             # Track consecutive failures to break infinite retry loops
             _track_tool_failure(fn_name, result, consecutive_failures)
 
-            # Notify client about result
+            # Notify client about result (send full result; frontend will collapse)
+            # Also send formatted args for display (e.g. HTML content with proper line breaks)
+            formatted_args = json.dumps(fn_args, indent=2, ensure_ascii=False)
             await _ws_safe_send(ws, {
                 "type": "tool_end",
                 "name": fn_name,
                 "index": i,
-                "result": result[:500] if len(result) > 500 else result,
+                "result": result,
                 "truncated": len(result) > 500,
+                "args": formatted_args,
             })
 
             # Add tool result to message history

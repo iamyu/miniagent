@@ -13,6 +13,7 @@ const state = {
     currentSessionId: null,  // current session ID from server
     wsReconnectAttempts: 0,  // track reconnection attempts
     wsMaxReconnectDelay: 30000,  // max 30s between retries
+    attachedFiles: [],  // [{name, path}]
 };
 
 const API_BASE = '';
@@ -24,6 +25,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     initEventListeners();
     connectWS();
 });
+
+// ============ File Browser State ============
+const fileBrowser = {
+    visible: false,
+    currentPath: '',       // relative path within project root
+    projectRoot: '',       // absolute project root from server
+    selectedPaths: new Set(),  // set of relative paths
+    allItems: [],          // current directory items
+};
 
 // ============ WebSocket ============
 function connectWS() {
@@ -108,7 +118,7 @@ function handleWSMessage(msg) {
         const cardIdx = state.currentAssistant.tools.length - 1;
         console.debug(`[tool_start] name=${msg.name}, index=${cardIdx}, args_type=${typeof msg.args}`);
         appendToolCard(msg.name, msg.args, cardIdx);
-        showProcessing('模型正在生成参数: ' + msg.name + '...');
+        // tool card already shows "生成参数中..." — no separate showProcessing needed
     }
     else if (type === 'tool_args') {
         // Stream raw tool call arguments into the tool card in real-time
@@ -142,12 +152,18 @@ function handleWSMessage(msg) {
             tool.result = msg.result;
             tool.truncated = msg.truncated;
             tool.done = true;
+            tool.args = msg.args || tool.args;  // formatted args from backend
             updateToolCard(tool, idx);
         }
-        // Show completed tools count
+        // Card status already updated to "已完成" in updateToolCard above.
+        // For multi-tool scenarios, show brief progress in the processing line.
         const doneCount = state.currentAssistant?.tools.filter(t => t.done).length || 0;
         const totalCount = state.currentAssistant?.tools.length || 0;
-        showProcessing('已完成 ' + doneCount + '/' + totalCount + ' 个工具, 生成回答中...');
+        if (totalCount > 1 && doneCount < totalCount) {
+            showProcessing('工具进度: ' + doneCount + '/' + totalCount);
+        } else {
+            hideProcessing();
+        }
     }
     else if (type === 'done') {
         // Show tool completion summary as a system message
@@ -224,7 +240,7 @@ function initEventListeners() {
     chatInput.addEventListener('input', () => {
         chatInput.style.height = 'auto';
         chatInput.style.height = Math.min(chatInput.scrollHeight, 200) + 'px';
-        sendBtn.disabled = !chatInput.value.trim() || state.isStreaming;
+        updateSendBtn();
     });
 
     sendBtn.addEventListener('click', sendMessage);
@@ -245,6 +261,26 @@ function initEventListeners() {
             closeSkillsDropdown();
         }
     });
+
+    // File attach
+    document.getElementById('file-attach-btn').addEventListener('click', toggleFilePopover);
+    document.getElementById('file-path-insert').addEventListener('click', insertFilePath);
+    document.getElementById('file-browse-btn').addEventListener('click', browseLocalFile);
+    document.getElementById('file-path-input').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            insertFilePath();
+        }
+        if (e.key === 'Escape') closeFilePopover();
+    });
+    document.addEventListener('click', (e) => {
+        const popover = document.getElementById('file-path-popover');
+        const btn = document.getElementById('file-attach-btn');
+        if (popover && !popover.contains(e.target) && btn && !btn.contains(e.target)) {
+            closeFilePopover();
+        }
+    });
+    setupChatDrop();
 
     // Initialize history
     initHistoryRefresh();
@@ -367,16 +403,22 @@ async function loadSkills() {
 function sendMessage() {
     const input = document.getElementById('chat-input');
     const text = input.value.trim();
-    if (!text || state.isStreaming) return;
+    if ((!text && state.attachedFiles.length === 0) || state.isStreaming) return;
 
     state.isStreaming = true;
     document.getElementById('send-btn').disabled = true;
 
+    // Build message text with attached files
+    const fileText = getAttachedFilesText();
+    const fullText = text + fileText;
+    const displayText = text + (fileText ? '\n' + state.attachedFiles.map(f => f.name).join(', ') : '');
+
     input.value = '';
     input.style.height = 'auto';
+    clearAttachedFiles();
 
     // Show user message first, then assistant bubble
-    appendUserMessage(text);
+    appendUserMessage(displayText);
 
     // Show typing indicator (create bubble so processing element exists)
     state.currentAssistant = { content: '', tools: [] };
@@ -392,11 +434,10 @@ function sendMessage() {
     }
 
     if (state.wsConnected) {
-        sendWS({ message: text });
+        sendWS({ message: fullText });
     } else {
-        // WS not connected — try HTTP fallback and remind user
         appendSystemMessage('WebSocket 未连接，使用 HTTP 模式发送...');
-        sendViaHTTP(text);
+        sendViaHTTP(fullText);
     }
 }
 
@@ -421,7 +462,7 @@ async function sendViaHTTP(text) {
     } finally {
         hideProcessing();
         state.isStreaming = false;
-        document.getElementById('send-btn').disabled = !document.getElementById('chat-input').value.trim();
+        updateSendBtn();
     }
 }
 
@@ -516,7 +557,6 @@ function appendAssistantBubble() {
     div.innerHTML = `
         <div class="message-avatar">M</div>
         <div class="message-content">
-            <div id="current-tool-cards"></div>
             <div id="current-assistant-text">
                 <div class="typing-indicator">
                     <div class="typing-dot"></div>
@@ -524,6 +564,7 @@ function appendAssistantBubble() {
                     <div class="typing-dot"></div>
                 </div>
             </div>
+            <div id="current-tool-cards"></div>
             <div id="processing-indicator" class="processing-indicator" style="display:none"></div>
         </div>
     `;
@@ -592,10 +633,10 @@ function appendToolCard(name, args, idx) {
         ? JSON.stringify(args, null, 2)
         : (typeof args === 'string' ? args : String(args || ''));
     const card = document.createElement('div');
-    card.className = 'tool-card expanded';  // expanded by default
+    card.className = 'tool-card expanded';
     card.id = `tool-card-${idx}`;
     card.innerHTML = `
-        <div class="tool-card-header" onclick="toggleToolCard(${idx})">
+        <div class="tool-card-header">
             <span class="tool-icon">&#9881;</span>
             <span class="tool-name">${escapeHtml(name)}</span>
             <span class="tool-status running" id="tool-status-${idx}">生成参数中...</span>
@@ -617,17 +658,15 @@ function appendToolCardArgs(idx, chunk) {
         console.warn(`[tool_args] element #tool-args-${idx} not found`);
         return;
     }
-    const current = argsEl.textContent || '';
-    // Limit to 5000 chars to avoid DOM bloat with huge HTML
-    if (current.length > 5000) return;
-    // Check BEFORE DOM mutation
-    const nearBottom = isUserNearBottom();
-    argsEl.textContent = current + chunk;
-    // Also track in state for later use (e.g., file preview)
+    // Accumulate raw args in state for later formatting, but only show minimal preview during streaming
+    // (streamed chunks are partial JSON with escape sequences — unusable for display)
     if (state.currentAssistant && state.currentAssistant.tools[idx]) {
         state.currentAssistant.tools[idx].args = (state.currentAssistant.tools[idx].args || '') + chunk;
     }
-    if (nearBottom) scrollToBottom(true);
+    // Show progress indicator instead of raw JSON fragments
+    const raw = state.currentAssistant?.tools[idx]?.args || '';
+    const previewLen = Math.min(raw.length, 60);
+    argsEl.textContent = raw.slice(0, previewLen) + (raw.length > previewLen ? '\u2026' : '');
 }
 
 function updateToolCard(toolInfo, idx) {
@@ -638,19 +677,22 @@ function updateToolCard(toolInfo, idx) {
         status.textContent = '已完成';
         status.className = 'tool-status done';
     }
-    // Hide streamed args area — only show result when done
+    const body = card.querySelector('.tool-card-body');
+    if (!body) return;
+
+    // Replace streamed raw args with formatted version (with proper line breaks)
     const argsEl = card.querySelector(`#tool-args-${idx}`);
-    if (argsEl) argsEl.style.display = 'none';
+    if (argsEl && toolInfo.args) {
+        argsEl.textContent = toolInfo.args;
+        argsEl.style.display = 'block';
+    } else if (argsEl) {
+        argsEl.style.display = 'none';
+    }
     if (toolInfo.result) {
-        const body = card.querySelector('.tool-card-body');
-        if (body) {
-            let html = `<div class="tool-result-label">Result:</div>`;
-            html += `<div class="tool-result">${escapeHtml(toolInfo.result)}</div>`;
-            if (toolInfo.truncated) {
-                html += `<div style="font-size:11px;color:var(--text-muted);margin-top:4px">(Output truncated)</div>`;
-            }
-            body.innerHTML += html;
-        }
+        const fullResult = toolInfo.result;
+        let html = `<div class="tool-result-label">Result:</div>`;
+        html += `<div class="tool-result" id="tool-result-${idx}">${escapeHtml(fullResult)}</div>`;
+        body.innerHTML += html;
     }
 }
 
@@ -683,7 +725,7 @@ function finalizeAssistantMessage() {
     state.currentAssistant = null;
     state.isStreaming = false;
     hideProcessing();
-    document.getElementById('send-btn').disabled = !document.getElementById('chat-input').value.trim();
+    updateSendBtn();
     // If user scrolled up during response, don't yank them back to bottom
     if (isUserNearBottom()) scrollToBottom(true);
 }
@@ -920,7 +962,7 @@ function renderSkillsGrid() {
 
     grid.innerHTML = state.skills.map(skill => {
         const iconInfo = getSkillIconInfo(skill.name, skill.description || '');
-        const desc = (skill.description || '').replace(/\n/g, ' ').substring(0, 100);
+        const desc = (skill.description || '').replace(/\n/g, ' ');
         const triggers = skill.triggers || [];
         return `
             <div class="skill-card" data-name="${escapeAttr(skill.name)}">
@@ -972,7 +1014,7 @@ function renderSkillsDropdown() {
     html += '<div class="dropdown-list">';
     state.skills.forEach(skill => {
         const iconInfo = getSkillIconInfo(skill.name, skill.description || '');
-        const desc = (skill.description || '').replace(/\n/g, ' ').substring(0, 80);
+        const desc = (skill.description || '').replace(/\n/g, ' ');
         html += `
             <div class="dropdown-item" data-name="${escapeAttr(skill.name)}" data-desc="${escapeAttr(desc)}">
                 <span class="dropdown-item-icon ${iconInfo.cls}">${iconInfo.icon}</span>
@@ -1053,6 +1095,344 @@ function closeSkillsDropdown() {
     }
 }
 
+// ============ File Attach ============
+function renderFileTags() {
+    const container = document.getElementById('file-tags-container');
+    if (!container) return;
+    container.innerHTML = '';
+    if (state.attachedFiles.length === 0) {
+        container.classList.remove('has-files');
+        return;
+    }
+    container.classList.add('has-files');
+    state.attachedFiles.forEach((f, idx) => {
+        const tag = document.createElement('div');
+        tag.className = 'file-tag';
+        tag.setAttribute('data-tooltip', f.path);
+        tag.innerHTML = `
+            <span class="file-tag-name">${escapeHtml(f.name)}</span>
+            <button class="file-tag-remove" data-idx="${idx}" title="移除">×</button>
+        `;
+        container.appendChild(tag);
+    });
+    // Delegate click for remove buttons
+    container.onclick = (e) => {
+        const btn = e.target.closest('.file-tag-remove');
+        if (btn) {
+            const idx = parseInt(btn.getAttribute('data-idx'));
+            removeAttachedFile(idx);
+        }
+    };
+}
+
+function addAttachedFiles(fileList) {
+    const existing = new Set(state.attachedFiles.map(f => f.path));
+    for (const f of fileList) {
+        if (!existing.has(f.path)) {
+            state.attachedFiles.push({ name: f.name, path: f.path });
+            existing.add(f.path);
+        }
+    }
+    renderFileTags();
+    updateSendBtn();
+}
+
+function removeAttachedFile(idx) {
+    state.attachedFiles.splice(idx, 1);
+    renderFileTags();
+    updateSendBtn();
+}
+
+function toggleFilePopover() {
+    const popover = document.getElementById('file-path-popover');
+    const skillsDD = document.getElementById('skills-dropdown');
+    if (!popover) return;
+    closeSkillsDropdown();
+    const isVisible = popover.classList.toggle('visible');
+    if (isVisible) {
+        document.getElementById('file-path-input').focus();
+        hideFileBrowser();
+    }
+}
+
+function closeFilePopover() {
+    const popover = document.getElementById('file-path-popover');
+    if (popover) popover.classList.remove('visible');
+    const input = document.getElementById('file-path-input');
+    if (input) {
+        input.value = '';
+        input.placeholder = '输入或粘贴文件路径，如 D:\\docs\\report.docx';
+        input.style.borderColor = '';
+    }
+    hideFileBrowser();
+}
+
+// ============ File Browser (project-directory tree) ============
+async function browseLocalFile() {
+    const area = document.getElementById('file-browser-area');
+    const browserTitle = document.getElementById('file-browser-title');
+    if (!area) return;
+
+    // Toggle: if already visible, hide it
+    if (fileBrowser.visible) {
+        hideFileBrowser();
+        return;
+    }
+
+    // Show browser area and load root
+    area.style.display = 'block';
+    document.getElementById('file-path-popover').classList.add('browser-open');
+    fileBrowser.visible = true;
+    fileBrowser.currentPath = '';
+    fileBrowser.selectedPaths.clear();
+    fileBrowser.allItems = [];
+
+    if (browserTitle) browserTitle.textContent = '选择项目文件';
+    document.getElementById('file-browser-back').style.display = 'none';
+    document.getElementById('file-browse-btn').textContent = '关闭浏览';
+    document.getElementById('file-path-input').placeholder = '也可以直接输入路径';
+
+    showFileBrowserLoading();
+    await loadFileBrowserDir('');
+}
+
+async function loadFileBrowserDir(relPath) {
+    const treeEl = document.getElementById('file-browser-tree');
+    if (!treeEl) return;
+
+    try {
+        const res = await fetch(`${API_BASE}/api/browse-files?path=${encodeURIComponent(relPath)}`);
+        const data = await res.json();
+        if (data.error) {
+            treeEl.innerHTML = `<div class="file-browser-error">${escapeHtml(data.error)}</div>`;
+            return;
+        }
+
+        fileBrowser.projectRoot = data.root;
+        fileBrowser.currentPath = data.current_path || '';
+        fileBrowser.allItems = data.tree || [];
+
+        document.getElementById('file-browser-back').style.display = data.current_path ? '' : 'none';
+
+        renderFileBrowserTree(data.tree, data.root, data.current_path);
+    } catch (e) {
+        console.error('Browse files failed:', e);
+        treeEl.innerHTML = '<div class="file-browser-error">加载失败</div>';
+    } finally {
+        hideFileBrowserLoading();
+    }
+}
+
+function renderFileBrowserTree(items, projectRoot, currentPath) {
+    const treeEl = document.getElementById('file-browser-tree');
+    if (!treeEl) return;
+
+    if (!items || items.length === 0) {
+        treeEl.innerHTML = '<div class="file-browser-empty">目录为空</div>';
+        return;
+    }
+
+    treeEl.innerHTML = items.map(item => {
+        const isDir = item.type === 'dir';
+        const fullPath = projectRoot.replace(/\\/g, '/') + '/' + item.path;
+        const isSelected = fileBrowser.selectedPaths.has(item.path);
+        return `
+            <div class="file-tree-item ${isDir ? 'dir' : ''} ${isSelected ? 'selected' : ''}"
+                 data-path="${escapeAttr(item.path)}"
+                 data-type="${item.type}"
+                 title="${escapeAttr(fullPath)}">
+                <span class="file-tree-icon">${isDir ? '📁' : '📄'}</span>
+                <span class="file-tree-name">${escapeHtml(item.name)}</span>
+                ${!isDir ? `<span class="file-tree-check ${isSelected ? 'checked' : ''}"></span>` : ''}
+            </div>
+        `;
+    }).join('');
+
+    // Click handlers
+    treeEl.querySelectorAll('.file-tree-item').forEach(el => {
+        el.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const path = el.dataset.path;
+            const type = el.dataset.type;
+            if (type === 'dir') {
+                // Navigate into directory
+                navigateFileBrowser(path);
+            } else {
+                // Toggle file selection
+                toggleFileSelection(path, el);
+            }
+        });
+    });
+}
+
+function navigateFileBrowser(path) {
+    fileBrowser.selectedPaths.clear(); // clear selection when navigating
+    fileBrowser.currentPath = path;
+    showFileBrowserLoading();
+    loadFileBrowserDir(path);
+}
+
+function toggleFileSelection(relPath, el) {
+    if (fileBrowser.selectedPaths.has(relPath)) {
+        fileBrowser.selectedPaths.delete(relPath);
+        el.classList.remove('selected');
+        const check = el.querySelector('.file-tree-check');
+        if (check) check.classList.remove('checked');
+    } else {
+        fileBrowser.selectedPaths.add(relPath);
+        el.classList.add('selected');
+        const check = el.querySelector('.file-tree-check');
+        if (check) check.classList.add('checked');
+    }
+}
+
+function showFileBrowserLoading() {
+    const loading = document.getElementById('file-browser-loading');
+    const tree = document.getElementById('file-browser-tree');
+    if (loading) loading.style.display = 'flex';
+    if (tree) tree.innerHTML = '';
+}
+
+function hideFileBrowserLoading() {
+    const loading = document.getElementById('file-browser-loading');
+    if (loading) loading.style.display = 'none';
+}
+
+function hideFileBrowser() {
+    const area = document.getElementById('file-browser-area');
+    if (area) area.style.display = 'none';
+    document.getElementById('file-path-popover').classList.remove('browser-open');
+    fileBrowser.visible = false;
+    fileBrowser.selectedPaths.clear();
+    document.getElementById('file-browse-btn').textContent = '浏览文件';
+    document.getElementById('file-browser-title').textContent = '引用本地文件';
+    document.getElementById('file-browser-back').style.display = 'none';
+    document.getElementById('file-path-input').placeholder = '输入或粘贴文件路径，如 D:\\docs\\report.docx';
+}
+
+// Back button handler
+document.addEventListener('DOMContentLoaded', () => {
+    const backBtn = document.getElementById('file-browser-back');
+    if (backBtn) {
+        backBtn.addEventListener('click', () => {
+            // Go to parent directory
+            const parentPath = fileBrowser.currentPath.split('/').slice(0, -1).join('/');
+            fileBrowser.selectedPaths.clear();
+            navigateFileBrowser(parentPath || '');
+        });
+    }
+});
+
+function insertFilePath() {
+    const input = document.getElementById('file-path-input');
+    const manualPath = input.value.trim();
+    const fileList = [];
+
+    // Collect manually typed paths
+    if (manualPath) {
+        const paths = manualPath.split(/[,\n]+/).map(p => p.trim()).filter(Boolean);
+        for (const p of paths) {
+            fileList.push({
+                name: p.split(/[\\/]/).pop() || p,
+                path: p
+            });
+        }
+    }
+
+    // Collect files selected from the tree browser
+    if (fileBrowser.visible && fileBrowser.selectedPaths.size > 0) {
+        for (const relPath of fileBrowser.selectedPaths) {
+            const name = relPath.split('/').pop() || relPath;
+            const fullPath = fileBrowser.projectRoot.replace(/\\/g, '/') + '/' + relPath;
+            // Avoid duplicates
+            if (!fileList.some(f => f.path === fullPath)) {
+                fileList.push({ name, path: fullPath });
+            }
+        }
+    }
+
+    if (fileList.length === 0) return;
+
+    addAttachedFiles(fileList);
+    input.value = '';
+    input.style.borderColor = '';
+    input.placeholder = '输入或粘贴文件路径，如 D:\\\\docs\\\\report.docx';
+    closeFilePopover();
+}
+
+function getAttachedFilesText() {
+    if (state.attachedFiles.length === 0) return '';
+    return '\n\n[引用的文件]\n' + state.attachedFiles.map(f => f.path).join('\n');
+}
+
+function clearAttachedFiles() {
+    state.attachedFiles = [];
+    renderFileTags();
+}
+
+// ============ Drag & Drop files on chat area ============
+function setupChatDrop() {
+    const chatArea = document.getElementById('chat-messages');
+    if (!chatArea) return;
+
+    chatArea.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        chatArea.classList.add('drag-over');
+    });
+
+    chatArea.addEventListener('dragleave', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!chatArea.contains(e.relatedTarget)) {
+            chatArea.classList.remove('drag-over');
+        }
+    });
+
+    chatArea.addEventListener('drop', async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        chatArea.classList.remove('drag-over');
+
+        const dt = e.dataTransfer;
+        if (!dt || !dt.files || dt.files.length === 0) return;
+
+        const fileList = [];
+        // Try to get real paths from FileSystemEntry (works on Windows drag from Explorer)
+        if (dt.items && dt.items.length > 0) {
+            const entries = [];
+            for (const item of dt.items) {
+                const entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
+                entries.push(entry);
+            }
+            for (let i = 0; i < entries.length; i++) {
+                const f = dt.files[i];
+                const entry = entries[i];
+                // webkitRelativePath may provide relative path, fallback to name
+                let path = f.name;
+                if (entry && entry.fullPath && entry.fullPath !== '/' + f.name) {
+                    path = entry.fullPath.replace(/^\//, '');
+                }
+                fileList.push({ name: f.name, path: path });
+            }
+        } else {
+            for (const f of dt.files) {
+                fileList.push({ name: f.name, path: f.name });
+            }
+        }
+        addAttachedFiles(fileList);
+    });
+}
+
+function updateSendBtn() {
+    const input = document.getElementById('chat-input');
+    const btn = document.getElementById('send-btn');
+    if (!btn) return;
+    const hasText = input && input.value.trim();
+    const hasFiles = state.attachedFiles.length > 0;
+    btn.disabled = (!hasText && !hasFiles) || state.isStreaming;
+}
+
 // ============ Utilities ============
 function removeWelcome() {
     const welcome = document.querySelector('.welcome-message');
@@ -1071,11 +1451,6 @@ function scrollToBottom(force = false) {
         }
         container.scrollTop = container.scrollHeight;
     });
-}
-
-function toggleToolCard(idx) {
-    const card = document.getElementById(`tool-card-${idx}`);
-    if (card) card.classList.toggle('expanded');
 }
 
 function copyCode(id) {
@@ -1206,14 +1581,62 @@ async function loadHistory() {
             });
         });
 
-        // Delete button handlers
+        // Delete button handlers — custom popover instead of browser confirm()
+        let activePopover = null;
+
+        function dismissPopover() {
+            if (activePopover) {
+                activePopover.remove();
+                activePopover = null;
+            }
+        }
+
+        document.addEventListener('click', dismissPopover, true);
+
         container.querySelectorAll('.history-delete-btn').forEach(btn => {
             btn.addEventListener('click', (e) => {
                 e.stopPropagation();
-                const sid = btn.dataset.sid;
-                if (confirm('确定要删除这个历史对话吗？')) {
-                    deleteSession(sid);
+                // Already showing popover for this button → toggle off
+                if (activePopover && activePopover._ownerBtn === btn) {
+                    dismissPopover();
+                    return;
                 }
+                dismissPopover();
+
+                const sid = btn.dataset.sid;
+                const item = btn.closest('.history-item');
+                if (!item) return;
+
+                const pop = document.createElement('div');
+                pop.className = 'delete-confirm-pop';
+                pop._ownerBtn = btn;
+                pop.innerHTML = `<span>确认删除？</span>
+                    <button class="confirm-yes">确认</button>
+                    <button class="confirm-no">取消</button>`;
+
+                pop.querySelector('.confirm-yes').addEventListener('click', (ev) => {
+                    ev.stopPropagation();
+                    dismissPopover();
+                    deleteSession(sid);
+                });
+                pop.querySelector('.confirm-no').addEventListener('click', (ev) => {
+                    ev.stopPropagation();
+                    dismissPopover();
+                });
+
+                // Prevent popover clicks from bubbling to document listener
+                pop.addEventListener('click', (ev) => ev.stopPropagation());
+
+                item.appendChild(pop);
+
+                // Position popover directly below the delete icon, horizontally centered
+                const btnRect = btn.getBoundingClientRect();
+                const itemRect = item.getBoundingClientRect();
+                pop.style.top = (btnRect.bottom - itemRect.top + 4) + 'px';
+                pop.style.left = (btnRect.left + btnRect.width / 2 - itemRect.left) + 'px';
+                pop.style.transform = 'translateX(-50%)';
+
+                activePopover = pop;
             });
         });
 

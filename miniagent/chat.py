@@ -74,6 +74,19 @@ class ChatEngine:
                 '- run_node(path="build.js", cwd="my-ppt")\n'
                 '- run_python(code="import os; print(os.getcwd())")\n'
                 '- run_node(path="script.js", args="--production", timeout=120)\n\n'
+                "# Platform: Windows / PowerShell\n\n"
+                "This environment is Windows (PowerShell 5.1). ALL shell commands MUST use PowerShell syntax, NOT bash.\n"
+                "Critical rules:\n"
+                "- Use `mkdir \"path\"` NOT `mkdir -p path` (PowerShell doesn't support -p, creates literal '-p' dir)\n"
+                "- Use `xcopy \"src\" \"dst\" /E /I /Y /Q` NOT `cp -r`\n"
+                "- Use `Remove-Item \"path\" -Recurse -Force` NOT `rm -rf`\n"
+                "- Use `Get-Content \"file\"` NOT `cat file`\n"
+                "- Use `;` for command chaining, NOT `&&` (PowerShell 5.1 does NOT support `&&` at all)\n"
+                "- Environment variables: use `$env:VAR=\"value\"` NOT `VAR=value` (bash syntax)\n"
+                "  Example: `$env:NODE_OPTIONS=\"\"; node script.js` NOT `NODE_OPTIONS=\"\" node script.js`\n"
+                "- To set env var for current process: `$env:VAR=\"value\"; your-command`\n"
+                "- Paths use backslash `\\` or forward slash `/` (both work in PowerShell)\n"
+                "- Never use bash-specific syntax: `mkdir -p`, `cp -r`, `rm -rf`, `&&`, `||`, `$(...)`, `VAR=val cmd`\n\n"
                 f"# Output Directory\n\n"
                 f"MiniAgent 安装目录: {miniagent_root}\n"
                 f"所有生成的文件（PPT、HTML、文档等）统一输出到: {miniagent_root / 'output'}\n"
@@ -103,6 +116,93 @@ class ChatEngine:
                 extra_content = self.skills.build_context(extra)
                 if extra_content:
                     parts.append(f"# Activated Skills\n\n{extra_content}")
+
+        # Global rule: ALL HTML output MUST be self-contained (single file, zero external file deps)
+        parts.append(
+            "# CRITICAL: Self-Contained HTML Rule\n\n"
+            "EVERY HTML file you generate MUST be fully self-contained — a single .html file that "
+            "renders correctly when opened directly in a browser. This is the #1 rule for HTML output.\n"
+            "What this means:\n"
+            "- ALL CSS must be inside `<style>...</style>` tags in the `<head>`, NOT `<link href=\"...\">`\n"
+            "- ALL JavaScript must be inside `<script>...</script>` tags, NOT `<script src=\"...\">`\n"
+            "- Use `read_file` to read the content of any needed CSS/JS file, then paste it inline\n"
+            "- CDN font imports (Google Fonts `@import url(...)`) are the ONLY allowed external references\n"
+            "- NEVER write `<link href=\"*.css\">` or `<script src=\"*.js\">` — always inline instead\n"
+            "- CRITICAL: If any inlined JS contains the literal string `</script>` (e.g. inside a "
+            "template literal), you MUST escape it as `<\\/script>`. Otherwise the HTML parser "
+            "will terminate the `<script>` element prematurely, dumping raw JS onto the page.\n"
+        )
+
+        # General principle: prefer CLI over Python for one-off operations
+        parts.append(
+            "# CRITICAL: Prefer CLI over Python scripts for one-off operations\n\n"
+            "When a task can be done with a single shell command (e.g. file conversion, "
+            "text processing, downloading), use the `shell` tool directly. Do NOT write "
+            "multi-line Python scripts for simple operations. Writing code adds unnecessary "
+            "risk of syntax errors, encoding issues, and `\\n` literal confusion.\n"
+            "File conversion tools — use via `shell`, NOT `run_node`:\n"
+            "- markitdown: Python CLI (pip install markitdown). NOT a Node.js module. "
+            "Convert Office→Markdown: `markitdown input.docx -o output.md`\n"
+            "- pandoc: Convert Markdown→Word: `pandoc input.md -o output.docx`\n"
+            "- When pandoc is unavailable, use the `docx` skill for Word documents\n"
+            "Other CLI examples:\n"
+            "- Process text: `rg 'pattern' file.txt` or `sed` (CLI) ✓\n"
+            "- Create files: use the `write_file` tool directly ✓\n"
+        )
+
+        # html-ppt skill asset path guidance
+        all_active = list(always_skills)
+        if active_skills:
+            always_names = {s.name for s in always_skills}
+            all_active.extend(s for s in active_skills if s.name not in always_names)
+        html_ppt = next((s for s in all_active if s.name == "html-ppt"), None)
+        if html_ppt:
+            assets_dir = html_ppt.path.parent / 'assets'
+            parts.append(
+                "# html-ppt Slide Architecture (READ BEFORE GENERATING — OR RESULT WILL BE BROKEN)\n\n"
+                "The html-ppt skill provides a complete slide system. You MUST use it. "
+                "NEVER write custom CSS/JS to replace the slide engine — your job is ONLY to write "
+                "the slide CONTENT (text, layouts, cards) inside the skill's structure.\n\n"
+                "## Mandatory Architecture (non-negotiable)\n\n"
+                "Every slide deck MUST follow this exact structure:\n"
+                "```\n"
+                "<div class=\"deck\">\n"
+                "  <section class=\"slide is-active\" data-title=\"Slide 1\">\n"
+                "    <!-- YOUR CONTENT HERE -->\n"
+                "    <aside class=\"notes\"><!-- speaker notes (optional) --></aside>\n"
+                "  </section>\n"
+                "  <section class=\"slide\" data-title=\"Slide 2\">\n"
+                "    <!-- YOUR CONTENT HERE -->\n"
+                "  </section>\n"
+                "  ...\n"
+                "</div>\n"
+                "<div style=\"position:fixed;bottom:12px;left:12px;font-size:11px;color:#888;z-index:100;pointer-events:none\">\n"
+                "  S — 演讲者视图 · T — 切换主题 · ← → — 翻页 · F — 全屏 · O — 总览\n"
+                "</div>\n"
+                "<script>/* runtime.js content here */</script>\n"
+                "```\n\n"
+                "## Rules\n"
+                "1. **One `<section class=\"slide\">` per logical page** — 5 slides means 5 `<section>` elements.\n"
+                "2. **base.css IS the slide engine** — its `.deck` (viewport container) and `.slide` (absolute overlay) "
+                "CSS must be inlined. Without it, slides collapse into a scrollable document.\n"
+                "3. **runtime.js IS the keyboard navigator** — ← → space PgUp PgDn S T F O keys. MUST be inlined at bottom.\n"
+                "4. **DO NOT write your own slide code** — no scroll-based nav, no IntersectionObserver, no margin-bottom slides, "
+                "no custom animation frameworks. All of that is already in base.css + runtime.js.\n"
+                "5. If slides look like a scrolling document instead of paginated — you did something wrong.\n\n"
+                "## How to inline (use read_file)\n"
+                f"Read these from {assets_dir} and paste inline:\n"
+                f"  1. `{assets_dir / 'fonts.css'}` → <style> (CDN @import rules — only external refs allowed)\n"
+                f"  2. `{assets_dir / 'base.css'}` → <style> (MANDATORY — the slide engine)\n"
+                f"  3. `{assets_dir / 'themes' / '<chosen>.css'}` → <style> (pick ONE theme)\n"
+                f"  4. `{assets_dir / 'animations' / 'animations.css'}` → <style> (if using data-anim)\n"
+                f"  5. `{assets_dir / 'runtime.js'}` → <script> at end of <body> (MANDATORY — keyboard nav)\n"
+                f"  6. `{assets_dir / 'animations' / 'fx-runtime.js'}` + fx/*.js → <script> (only if using data-fx)\n\n"
+                "## DO NOT\n"
+                "- Omit base.css or runtime.js\n"
+                "- Write custom scrolling/IntersectionObserver/navigation code\n"
+                "- Make slides display as a vertical document (margin-bottom, scroll behavior)\n"
+                "- Use `<link href=\"...\">` or `<script src=\"...\">` — always inline\n"
+            )
 
         # Skills summary
         summary = self.skills.build_summary()

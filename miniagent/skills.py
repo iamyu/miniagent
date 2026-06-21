@@ -107,31 +107,8 @@ class SkillsLoader:
         self._load_all()
         return list(self._cache.values())
 
-    @staticmethod
-    def _trigger_matches(trigger: str, user_input_lower: str) -> bool:
-        """Check if a trigger matches the user input at word boundaries.
-
-        For ASCII triggers, uses \\b word boundaries to prevent false positives
-        like "html" matching "html2canvas" or "cat" matching "concatenate".
-
-        For CJK triggers, uses substring matching since Chinese characters don't
-        concatenate into longer words the way English does.
-        """
-        tl = trigger.lower()
-        ul = user_input_lower
-        # CJK trigger → safe to use substring (no concatenation risk)
-        if any('\u4e00' <= c <= '\u9fff' for c in tl):
-            return tl in ul
-        # ASCII trigger → word boundary to avoid partial-word false matches
-        pattern = r'\b' + re.escape(tl) + r'\b'
-        return bool(re.search(pattern, ul))
-
     def match_triggers(self, user_input: str) -> list[Skill]:
         """Match skills whose triggers appear in user input.
-
-        Triggers are matched at word boundaries via _trigger_matches(),
-        so "html" will NOT accidentally match "html2canvas",
-        and "cat" won't match "concatenate".
 
         Returns skills sorted by number of triggered keywords (most matches first).
         """
@@ -145,7 +122,7 @@ class SkillsLoader:
                 continue
             match_count = sum(
                 1 for trigger in skill.triggers
-                if self._trigger_matches(trigger, input_lower)
+                if trigger.lower() in input_lower
             )
             if match_count > 0:
                 scored.append((match_count, skill))

@@ -607,7 +607,7 @@ class WebFetchTool(Tool):
 # ---------------------------------------------------------------------------
 
 class ShellTool(Tool):
-    """Execute Windows CMD commands."""
+    """Execute shell commands (PowerShell on Windows, bash/sh on Linux/macOS)."""
 
     MAX_TIMEOUT = 300  # Hard limit: 5 minutes
 
@@ -616,11 +616,8 @@ class ShellTool(Tool):
         "del /s", "del /q", "rmdir /s", "rd /s",
         "diskpart", "bcdedit", "reg delete", "net user",
         "shutdown", "taskkill /f", "wmic",
+        "rm -rf /", "sudo rm", "dd if=",
     ]
-
-    # Regex for CMD disk format command: matches "format C:", "format d: /q"
-    # but NOT PowerShell parameters like "-Format '...'" or "echo format C:"
-    _FORMAT_REGEX = re.compile(r'(?:^|[\n;&|])\s*format\s+[a-z]\s*:', re.IGNORECASE | re.MULTILINE)
 
     @property
     def name(self) -> str:
@@ -629,8 +626,8 @@ class ShellTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Execute a Windows CMD command. Use for file operations (copy, move, delete), "
-            "running scripts (python, node, npm), system info, and other CLI tasks. "
+            "Execute a shell command. On Windows uses PowerShell, on Linux/macOS uses bash. "
+            "Supports common commands (Get-ChildItem, dir, copy, python, node, npm, git, etc.). "
             "Returns stdout and stderr. Set timeout for long-running commands (default 30s, max 300s). "
             "Set cwd to change working directory."
         )
@@ -642,7 +639,7 @@ class ShellTool(Tool):
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "CMD command to execute (e.g., 'dir', 'copy a.txt b.txt', 'python script.py')",
+                    "description": "Shell command to execute. On Windows use PowerShell syntax (e.g. 'Get-ChildItem', 'dir', 'python script.py').",
                 },
                 "timeout": {
                     "type": "integer",
@@ -677,15 +674,8 @@ class ShellTool(Tool):
                 return (
                     f"Error: Command blocked for safety. "
                     f"The pattern '{pattern}' is considered dangerous. "
-                    f"If you really need this, run it manually in CMD."
+                    f"If you really need this, run it manually."
                 )
-        # Extra: block "format X:" disk formatting (but not PowerShell -Format)
-        if self._FORMAT_REGEX.search(command):
-            return (
-                "Error: Command blocked for safety. "
-                "Disk formatting commands (format X:) are not allowed. "
-                "If you really need this, run it manually in CMD."
-            )
 
         try:
             import subprocess
@@ -703,20 +693,42 @@ class ShellTool(Tool):
                     d = project_runtime / sub
                     if d.exists():
                         runtime_dirs.append(str(d))
+                    # Also add Scripts/ for pip-installed CLI tools (e.g. markitdown)
+                    scripts = d / "Scripts"
+                    if scripts.exists():
+                        runtime_dirs.append(str(scripts))
             if runtime_dirs:
                 env["PATH"] = _os.pathsep.join(runtime_dirs + env.get("PATH", "").split(_os.pathsep))
 
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                cwd=cwd or None,
-                encoding="gbk",
-                errors="replace",
-                env=env,
-            )
+            # On Windows, use PowerShell instead of cmd.exe.
+            # PowerShell handles both its native cmdlets (Get-ChildItem, etc.)
+            # and legacy CMD commands (dir, copy, etc.).
+            if _os.name == "nt":
+                # Force UTF-8 output to avoid garbled Chinese error messages
+                utf8_prefix = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", utf8_prefix + command],
+                    shell=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    cwd=cwd or None,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=env,
+                )
+            else:
+                result = subprocess.run(
+                    command,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    cwd=cwd or None,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=env,
+                )
 
             exit_code = result.returncode
             stdout = result.stdout.rstrip() if result.stdout else ""
@@ -857,10 +869,19 @@ def _setup_runtime_environment() -> None:
     _python_dir = _runtime_root / "python"
     if _python_dir.is_dir():
         _python_dir_str = str(_python_dir)
+        _scripts_dir = str(_python_dir / "Scripts")
         _current_path = _os.environ.get("PATH", "")
         _path_entries = _current_path.split(_os.pathsep)
+
+        # Prepend Scripts/ first (for pip-installed CLI entry points),
+        # then the python/ dir itself (for python.exe).
+        _new_entries = []
+        if _scripts_dir not in _path_entries:
+            _new_entries.append(_scripts_dir)
         if _python_dir_str not in _path_entries:
-            _os.environ["PATH"] = _python_dir_str + _os.pathsep + _current_path
+            _new_entries.append(_python_dir_str)
+        if _new_entries:
+            _os.environ["PATH"] = _os.pathsep.join(_new_entries + [_current_path])
 
         # pip cache inside runtime dir
         _os.environ["PIP_CACHE_DIR"] = str(_python_dir / ".pip-cache")
@@ -1199,13 +1220,13 @@ class SaveDocumentTool(Tool):
         miniagent_root = Path(__file__).resolve().parent.parent
         return miniagent_root / "output"
 
-    # Auto-detect extension from content
+    # Auto-detect extension from content.
+    # These patterns are checked via substring match (order matters, first wins).
+    # Patterns that are too common (e.g. '#', '{', ',') are excluded here
+    # and handled by explicit checks in _detect_extension().
     _TYPE_HINTS: list[tuple[str, str]] = [
         ("<!DOCTYPE html", ".html"), ("<html", ".html"),
-        ("# ", ".md"),             # Common MD heading
-        ("```", ".md"),            # Code block in MD
-        ("{", ".json"),            # Likely JSON
-        (",", ".csv"),             # Likely CSV
+        ("```", ".md"),            # Fenced code block → Markdown
     ]
 
     @property
@@ -1263,6 +1284,12 @@ class SaveDocumentTool(Tool):
                 filename = f"{fp.stem}{ext}"
 
             filepath = output_dir / filename
+
+            # Fix HTML: escape </script> inside <script> blocks to prevent
+            # premature script termination (common in runtime.js template literals).
+            if filepath.suffix == '.html' or filepath.suffix == '.htm':
+                content = self._fix_script_escape(content)
+
             filepath.write_text(content, encoding="utf-8")
             return f"Document saved to: {filepath}\n(Characters: {len(content)})"
         except PermissionError as e:
@@ -1277,13 +1304,27 @@ class SaveDocumentTool(Tool):
         return f"doc_{ts}{ext}"
 
     def _detect_extension(self, content: str) -> str:
-        """Detect file extension from content."""
-        # Check first 500 chars for type hints
-        preview = content[:500].strip().lower()
+        """Detect file extension from content.
+
+        Detection order: HTML → Markdown → JSON → CSV → .txt
+        Uses explicit checks rather than broad substring matching to avoid
+        false positives (e.g. '#' appearing in code or ',' appearing everywhere).
+        """
+        preview = content[:500].strip()
+        preview_lower = preview.lower()
+
+        # 1. Broad-match hints: HTML doctype/tag, fenced code blocks
         for hint, ext in self._TYPE_HINTS:
-            if hint.lower() in preview:
+            if hint.lower() in preview_lower:
                 return ext
-        # Check if content is valid JSON
+
+        # 2. Markdown: starts with heading (# or ##) or YAML frontmatter (---)
+        if preview.startswith("# ") or preview.startswith("## ") or \
+           preview.startswith("---") or preview.startswith("* ") or \
+           preview.startswith("- ") or preview.startswith("> "):
+            return ".md"
+
+        # 3. JSON: validate structure with json.loads
         stripped = content.strip()
         if (stripped.startswith("{") and stripped.endswith("}")) or \
            (stripped.startswith("[") and stripped.endswith("]")):
@@ -1292,8 +1333,49 @@ class SaveDocumentTool(Tool):
                 return ".json"
             except (json.JSONDecodeError, ValueError):
                 pass
-        # Default to .txt
+
+        # 4. CSV: multiple non-empty lines with consistent comma count (>0)
+        # and no pipe characters (which indicate a Markdown table)
+        lines = preview.split("\n")
+        non_empty = [l for l in lines if l.strip()]
+        if len(non_empty) >= 2:
+            comma_counts = [l.count(",") for l in non_empty[:10]]
+            if len(set(comma_counts)) == 1 and comma_counts[0] > 0:
+                if not any("|" in l for l in non_empty[:3]):
+                    return ".csv"
+
+        # Default
         return ".txt"
+
+    @staticmethod
+    def _fix_script_escape(content: str) -> str:
+        """Escape </script> inside <script> blocks to prevent premature termination.
+
+        The HTML parser terminates a <script> element as soon as it sees
+        ``</script>`` (case-insensitive), even inside a JavaScript string
+        literal.  This is a well-known footgun when inlining JS that
+        contains template literals with embedded ``</script>`` (e.g.
+        runtime.js's ``buildPresenterHTML`` function).
+
+        We replace ``</script>`` → ``<\\/script>`` inside every
+        ``<script>...</script>`` block.  The backslash-escaped version is
+        treated as a regular string by the JS engine but does NOT trigger
+        the HTML parser to close the element.
+        """
+        import re
+        def _escape_in_script(m: re.Match) -> str:
+            inner = m.group(1)
+            # Escape </script> (case-insensitive) → <\/script>
+            inner = re.sub(r'(</script>)', r'<\\/script>', inner, flags=re.IGNORECASE)
+            return '<script>' + inner + '</script>'
+
+        # Match <script>...</script> (non-greedy, DOTALL for multi-line)
+        return re.sub(
+            r'<script>(.*?)</script>',
+            _escape_in_script,
+            content,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
 
 
 # ---------------------------------------------------------------------------

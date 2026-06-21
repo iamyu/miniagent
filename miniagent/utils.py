@@ -66,6 +66,22 @@ def sanitize_tool_arguments(arguments_str: str, tool_name: str = "unknown") -> s
         lambda s: _try_python_literal(s),
     ]
 
+    # For content-writing tools, try a specialized repair that handles
+    # unescaped double-quotes inside HTML/CSS in the content field.
+    if tool_name in ("write_file", "save_document"):
+        repaired = _repair_content_tool_args(raw)
+        if repaired:
+            try:
+                json.loads(repaired)
+                logger.info(
+                    "[tool_args] repaired '%s' content-tool arguments "
+                    "by extracting fields (fix #4): raw_len=%d",
+                    tool_name, len(raw)
+                )
+                return repaired
+            except json.JSONDecodeError:
+                pass
+
     for i, fix in enumerate(fixes_tried):
         try:
             repaired = fix(raw)
@@ -148,6 +164,55 @@ def _extract_json_object(s: str) -> str:
                     pass
 
     return s
+
+
+def _repair_content_tool_args(raw: str) -> str | None:
+    """Repair write_file/save_document args where content has unescaped quotes.
+
+    LLMs often output HTML/CSS with unescaped double-quotes inside the content
+    field (e.g. ``{..., "content": "<div class="foo">"``). Standard JSON
+    parsers choke on the inner quotes. This function extracts known fields
+    (path + content) using string-level parsing and rebuilds valid JSON.
+    """
+    import re
+
+    # Attempt to extract "path": "..." value
+    path_match = re.search(r'"path"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
+    path = json.loads('"' + path_match.group(1) + '"') if path_match else None
+
+    # Find the content value by locating "content": "..."
+    content_key_idx = raw.find('"content"')
+    if content_key_idx < 0:
+        return None
+
+    # Skip to after the value-starting quote: "content": "__HERE__
+    colon_idx = raw.find(':', content_key_idx)
+    if colon_idx < 0:
+        return None
+    value_start = raw.find('"', colon_idx)
+    if value_start < 0:
+        return None
+    content_start_idx = value_start + 1  # first char of content
+
+    # The content string extends to the last " before the final }
+    closing_brace = raw.rfind('}', max(0, content_start_idx))
+    if closing_brace < 0:
+        return None
+
+    # Walk back from closing_brace to find the closing quote of content
+    closing_quote = closing_brace - 1
+    while closing_quote > content_start_idx and raw[closing_quote] in (' ', '\t', '\n', '\r'):
+        closing_quote -= 1
+    if closing_quote <= content_start_idx or raw[closing_quote] != '"':
+        return None
+
+    content = raw[content_start_idx:closing_quote]
+
+    # Rebuild clean JSON with json.dumps (auto-escapes everything)
+    result = {"content": content}
+    if path:
+        result["path"] = path
+    return json.dumps(result, ensure_ascii=False)
 
 
 def _try_python_literal(s: str) -> str:
