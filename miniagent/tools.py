@@ -13,6 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+logger = logging.getLogger("miniagent")
+
 from .utils import logger as _log
 
 
@@ -133,6 +135,9 @@ class ReadFileTool(Tool):
             if not path:
                 return "Error: path is required"
             fp = Path(path)
+            # Fallback: if relative path not found in CWD, try output directory
+            if not fp.is_absolute() and not fp.exists():
+                fp = _get_output_dir() / path
             if not fp.exists():
                 return f"Error: File not found: {path}"
             if not fp.is_file():
@@ -198,7 +203,7 @@ class WriteFileTool(Tool):
             "Write content to a file. Creates parent directories if needed. "
             "Overwrites if the file exists. For partial edits, prefer edit_file. "
             "If path is a relative path (e.g. 'report.md' or 'sub/file.txt'), "
-            "it will be saved under ~/.miniagent/ directory automatically."
+            "it will be saved under the output directory automatically."
         )
 
     @property
@@ -208,7 +213,7 @@ class WriteFileTool(Tool):
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "File path. Relative paths (e.g. 'report.md') are saved to ~/.miniagent/. Absolute paths (e.g. 'D:\\report.md') are used as-is.",
+                    "description": "File path. Relative paths (e.g. 'report.md') are saved to the output directory. Absolute paths (e.g. 'D:\\report.md') are used as-is.",
                 },
                 "content": {"type": "string", "description": "Content to write to the file"},
             },
@@ -222,9 +227,9 @@ class WriteFileTool(Tool):
             if content is None:
                 return "Error: content is required"
             fp = Path(path)
-            # Relative path -> save under ~/.miniagent/
+            # Relative path -> save under output directory
             if not fp.is_absolute():
-                default_dir = Path.home() / ".miniagent"
+                default_dir = _get_output_dir()
                 fp = default_dir / fp
             fp.parent.mkdir(parents=True, exist_ok=True)
             fp.write_text(content, encoding="utf-8")
@@ -246,8 +251,10 @@ class EditFileTool(Tool):
     def description(self) -> str:
         return (
             "Edit a file by replacing old_text with new_text. "
+            "Read the file first with read_file, then batch ALL needed changes into ONE edit_file call. "
+            "Use large multi-line blocks for old_text/new_text to replace entire sections at once. "
             "If old_text appears multiple times, provide more context or set replace_all=true. "
-            "Copy the exact text from read_file output."
+            "Copy exact text from read_file output including whitespace and indentation."
         )
 
     @property
@@ -256,8 +263,21 @@ class EditFileTool(Tool):
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "File path to edit"},
-                "old_text": {"type": "string", "description": "The exact text to find (copy from read_file output)"},
-                "new_text": {"type": "string", "description": "The replacement text"},
+                "old_text": {
+                    "type": "string",
+                    "description": (
+                        "The exact text to find. Copy directly from read_file output. "
+                        "Make this span MULTIPLE LINES to replace entire sections in one call, "
+                        "not single lines."
+                    ),
+                },
+                "new_text": {
+                    "type": "string",
+                    "description": (
+                        "The replacement text. Should cover the full replacement for the entire "
+                        "old_text block, including all changed lines at once."
+                    ),
+                },
                 "replace_all": {"type": "boolean", "description": "Replace all occurrences (default false)"},
             },
             "required": ["path", "old_text", "new_text"],
@@ -293,6 +313,9 @@ class EditFileTool(Tool):
                 return "Error: new_text is required"
 
             fp = Path(path)
+            # Relative path -> resolve to output directory
+            if not fp.is_absolute():
+                fp = _get_output_dir() / fp
             if not fp.exists():
                 return f"Error: File not found: {path}"
 
@@ -388,6 +411,9 @@ class ListDirTool(Tool):
             if not path:
                 return "Error: path is required"
             dp = Path(path)
+            # Fallback: if relative path not found in CWD, try output directory
+            if not dp.is_absolute() and not dp.exists():
+                dp = _get_output_dir() / path
             if not dp.exists():
                 return f"Error: Directory not found: {path}"
             if not dp.is_dir():
@@ -648,11 +674,86 @@ class ShellTool(Tool):
                 },
                 "cwd": {
                     "type": "string",
-                    "description": "Working directory for the command (default: current directory)",
+                    "description": "Working directory for the command (default: output directory)",
                 },
             },
             "required": ["command"],
         }
+
+    @staticmethod
+    def _sanitize_command(command: str) -> str:
+        """Preprocess a shell command to fix CMD/bash-isms for PowerShell.
+
+        PowerShell 5.1 (Windows default) does NOT support &&, ||, 2>&1,
+        or CMD flags like /Y, /F, /Q, /S.
+
+        Transformations:
+        - ``&&`` → ``; if ($LASTEXITCODE -eq 0) {`` ... ``}``
+        - ``copy src dest /Y`` → ``Copy-Item src dest -Force``
+        - ``copy src dest`` → ``Copy-Item src dest``
+        - ``move src dest /Y`` → ``Move-Item src dest -Force``
+        - ``move src dest`` → ``Move-Item src dest``
+        - ``del /f /q file`` → ``Remove-Item file -Force -ErrorAction SilentlyContinue``
+        - ``del file`` → ``Remove-Item file``
+        """
+        import re
+
+        command = command.strip()
+
+        # ── Translate CMD built-in commands to PowerShell ──
+        # copy src dest [/Y]
+        m = re.match(r'^copy\s+(.+?)\s+(.+?)(\s+/Y)?$', command, re.IGNORECASE)
+        if m:
+            src, dst = m.group(1).strip(), m.group(2).strip()
+            flag = (m.group(3) or '').strip()
+            if '/Y' in flag.upper():
+                return f'Copy-Item {src} {dst} -Force'
+            return f'Copy-Item {src} {dst}'
+
+        # move src dest [/Y]
+        m = re.match(r'^move\s+(.+?)\s+(.+?)(\s+/Y)?$', command, re.IGNORECASE)
+        if m:
+            src, dst = m.group(1).strip(), m.group(2).strip()
+            flag = (m.group(3) or '').strip()
+            if '/Y' in flag.upper():
+                return f'Move-Item {src} {dst} -Force'
+            return f'Move-Item {src} {dst}'
+
+        # del [/f] [/q] file(s)
+        m = re.match(r'^del\s+(.*?)$', command, re.IGNORECASE)
+        if m:
+            rest = m.group(1).strip()
+            # Extract flags
+            flags = set()
+            while re.match(r'^/[fFqQsS]', rest):
+                flags.add(rest[1].upper())
+                rest = rest[2:].strip()
+            use_force = 'F' in flags or 'Q' in flags
+            use_silent = 'Q' in flags
+            if use_force:
+                if use_silent:
+                    return f'Remove-Item {rest} -Force -ErrorAction SilentlyContinue'
+                return f'Remove-Item {rest} -Force'
+            return f'Remove-Item {rest}'
+
+        # Quick return if nothing left to fix
+        if "&&" not in command:
+            return command
+
+        # Split by && and reconstruct with PowerShell conditional logic.
+        parts = command.split("&&")
+        parts = [p.strip() for p in parts]
+        if not parts:
+            return command
+
+        if len(parts) == 1:
+            return parts[0]
+
+        # Build: part1; if ($LASTEXITCODE -eq 0) { part2 }; ...
+        result = parts[0]
+        for p in parts[1:]:
+            result += f'; if ($LASTEXITCODE -eq 0) {{ {p} }}'
+        return result
 
     def execute(
         self,
@@ -663,6 +764,10 @@ class ShellTool(Tool):
     ) -> str:
         if not command:
             return "Error: command is required"
+
+        # Default cwd to output directory
+        if not cwd:
+            cwd = str(_get_output_dir())
 
         # Normalize timeout
         timeout = min(max(timeout or 30, 1), self.MAX_TIMEOUT)
@@ -677,9 +782,14 @@ class ShellTool(Tool):
                     f"If you really need this, run it manually."
                 )
 
+        # Sanitize bash-isms for PowerShell (e.g. && → ; if ...)
+        command = self._sanitize_command(command)
+
         try:
             import subprocess
             import os as _os
+
+            logger.debug("[shell] cwd=%s, timeout=%s, raw_command=%.500s", cwd, timeout, command)
 
             # Build environment: start from current process env (bundled runtimes
             # already in PATH via _setup_runtime_environment), then add any
@@ -733,6 +843,13 @@ class ShellTool(Tool):
             exit_code = result.returncode
             stdout = result.stdout.rstrip() if result.stdout else ""
             stderr = result.stderr.rstrip() if result.stderr else ""
+
+            logger.debug(
+                "[shell_result] exit=%d, stdout_len=%d, stderr_len=%d",
+                exit_code, len(stdout), len(stderr),
+            )
+            if stderr:
+                logger.debug("[shell_result] stderr (first 500):\n%s", stderr[:500])
 
             # Build output
             parts = []
@@ -826,44 +943,8 @@ def _setup_runtime_environment() -> None:
             "https://npmmirror.com/mirrors/playwright",
         )
 
-        # Remove NODE_OPTIONS to avoid conflicts with bundled Node.js
+        # --- Remove NODE_OPTIONS to avoid conflicts with bundled Node.js ---
         _os.environ.pop("NODE_OPTIONS", None)
-
-        # --- Debug: log PATH and Node.js env configuration ---
-        _node_exe = _node_dir / "node.exe"
-        _log.debug(
-            "[runtime_env] Node.js runtime configured:\n"
-            "  node_dir      = %s\n"
-            "  node_exe      = %s\n"
-            "  NODE_PATH     = %s\n"
-            "  NPM_CONFIG_CACHE = %s\n"
-            "  PLAYWRIGHT_BROWSERS_PATH = %s\n"
-            "  npm_config_registry = %s\n"
-            "  PLAYWRIGHT_DOWNLOAD_HOST = %s",
-            _node_dir_str,
-            str(_node_exe),
-            _os.environ.get("NODE_PATH", ""),
-            _os.environ.get("NPM_CONFIG_CACHE", ""),
-            _os.environ.get("PLAYWRIGHT_BROWSERS_PATH", ""),
-            _os.environ.get("npm_config_registry", ""),
-            _os.environ.get("PLAYWRIGHT_DOWNLOAD_HOST", ""),
-        )
-
-        # --- Verify: run node --version ---
-        if _node_exe.is_file():
-            try:
-                _ver_result = subprocess.run(
-                    [_node_exe, "--version"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                _ver = _ver_result.stdout.strip()
-                _log.debug("[runtime_env] Node.js version: %s", _ver)
-            except Exception:
-                _log.warning(
-                    "[runtime_env] Node.js found but failed to run --version"
-                )
 
     # --- Python runtime ---
     _python_dir = _runtime_root / "python"
@@ -892,14 +973,6 @@ def _setup_runtime_environment() -> None:
             "https://pypi.tuna.tsinghua.edu.cn/simple",
         )
 
-    # --- Debug: dump final PATH head ---
-    _final_path = _os.environ.get("PATH", "")
-    _path_parts = _final_path.split(_os.pathsep)
-    _log.debug(
-        "[runtime_env] Final PATH head (first %d entries):\n  %s",
-        min(5, len(_path_parts)),
-        "\n  ".join(_path_parts[:5]),
-    )
 
 
 # Execute at module import time — child processes will inherit these settings
@@ -969,7 +1042,7 @@ class RunNodeTool(Tool):
                 },
                 "cwd": {
                     "type": "string",
-                    "description": "Working directory for the script (default: current directory)",
+                    "description": "Working directory for the script (default: output directory)",
                 },
                 "timeout": {
                     "type": "integer",
@@ -989,6 +1062,10 @@ class RunNodeTool(Tool):
             return "Error: Either 'path' (script file) or 'code' (inline JS) is required"
         if path and code:
             return "Error: Provide either 'path' or 'code', not both"
+
+        # Default cwd to output directory
+        if not cwd:
+            cwd = str(_get_output_dir())
 
         timeout = min(max(timeout or 60, 1), self.MAX_TIMEOUT)
 
@@ -1021,15 +1098,19 @@ class RunNodeTool(Tool):
                 if args:
                     cmd.extend(args.split())
             else:
-                # File mode
+                # File mode — resolve relative paths against cwd
                 fp = Path(path)
+                if not fp.is_absolute():
+                    fp = Path(cwd) / fp
                 if not fp.exists():
-                    return f"Error: Script file not found: {path}"
+                    return f"Error: Script file not found: {path} (resolved to {fp})"
                 if not fp.is_file():
                     return f"Error: Not a file: {path}"
                 cmd = [node_exe, str(fp)]
                 if args:
                     cmd.extend(args.split())
+
+            logger.debug("[run_node] cwd=%s, timeout=%s, cmd=%s", cwd, timeout, cmd)
 
             result = subprocess.run(
                 cmd,
@@ -1040,6 +1121,13 @@ class RunNodeTool(Tool):
                 encoding="utf-8",
                 errors="replace",
                 env=clean_env,
+            )
+
+            logger.debug(
+                "[run_node_result] exit=%d, stdout_len=%d, stderr_len=%d",
+                result.returncode,
+                len(result.stdout or ""),
+                len(result.stderr or ""),
             )
 
             parts = []
@@ -1104,7 +1192,7 @@ class RunPythonTool(Tool):
                 },
                 "cwd": {
                     "type": "string",
-                    "description": "Working directory for the script (default: current directory)",
+                    "description": "Working directory for the script (default: output directory)",
                 },
                 "timeout": {
                     "type": "integer",
@@ -1124,6 +1212,10 @@ class RunPythonTool(Tool):
             return "Error: Either 'path' (script file) or 'code' (inline Python) is required"
         if path and code:
             return "Error: Provide either 'path' or 'code', not both"
+
+        # Default cwd to output directory
+        if not cwd:
+            cwd = str(_get_output_dir())
 
         timeout = min(max(timeout or 60, 1), self.MAX_TIMEOUT)
 
@@ -1151,15 +1243,19 @@ class RunPythonTool(Tool):
                 if args:
                     cmd.extend(args.split())
             else:
-                # File mode
+                # File mode — resolve relative paths against cwd
                 fp = Path(path)
+                if not fp.is_absolute():
+                    fp = Path(cwd) / fp
                 if not fp.exists():
-                    return f"Error: Script file not found: {path}"
+                    return f"Error: Script file not found: {path} (resolved to {fp})"
                 if not fp.is_file():
                     return f"Error: Not a file: {path}"
                 cmd = [python_exe, str(fp)]
                 if args:
                     cmd.extend(args.split())
+
+            logger.debug("[run_python] cwd=%s, timeout=%s, cmd=%s", cwd, timeout, cmd)
 
             # Use current process environment (bundled Python runtime already
             # in PATH, and PIP_CACHE_DIR already configured by
@@ -1175,6 +1271,13 @@ class RunPythonTool(Tool):
                 encoding="utf-8",
                 errors="replace",
                 env=run_env,
+            )
+
+            logger.debug(
+                "[run_python_result] exit=%d, stdout_len=%d, stderr_len=%d",
+                result.returncode,
+                len(result.stdout or ""),
+                len(result.stderr or ""),
             )
 
             parts = []
@@ -1210,15 +1313,23 @@ class RunPythonTool(Tool):
 # Save Document Tool
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Output directory helpers
+# ---------------------------------------------------------------------------
+
+def _get_output_dir() -> Path:
+    """Get the output directory under MiniAgent installation."""
+    miniagent_root = Path(__file__).resolve().parent.parent
+    return miniagent_root / "output"
+
+
 class SaveDocumentTool(Tool):
     """Save generated documents to MiniAgent's output directory."""
 
     @staticmethod
     def _get_output_dir() -> Path:
         """Get the output directory under MiniAgent installation."""
-        # MiniAgent package is at <install>/miniagent/, so output goes to <install>/output/
-        miniagent_root = Path(__file__).resolve().parent.parent
-        return miniagent_root / "output"
+        return _get_output_dir()
 
     # Auto-detect extension from content.
     # These patterns are checked via substring match (order matters, first wins).
@@ -1236,7 +1347,7 @@ class SaveDocumentTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Save generated documents to the output directory (~/.miniagent/output/). "
+            "Save generated documents to the output directory. "
             "Use this when you generate HTML pages, Markdown documents, JSON data, "
             "CSV files, or any other document content. "
             "If no filename is given, auto-generates one with timestamp. "
@@ -1388,11 +1499,9 @@ class FindSkillsTool(Tool):
     @staticmethod
     def _get_skills_dir() -> Path:
         """Get skills directory, respecting config override."""
-        from .config import load_config, get_app_dir
+        from .config import load_config, get_skills_dir
         cfg = load_config()
-        if cfg.get("skills_dir"):
-            return Path(cfg["skills_dir"]).expanduser()
-        return get_app_dir() / "skills"
+        return get_skills_dir(cfg)
 
     @property
     def name(self) -> str:
@@ -1564,6 +1673,10 @@ class UseSkillTool(Tool):
             fm_re = _re.compile(r"^---\s*\r?\n(.*?)\r?\n---\s*\r?\n?", _re.DOTALL)
             match = fm_re.match(content)
             skill_content = content[match.end():].strip() if match else content.strip()
+
+            # Replace hardcoded .workbuddy/skills/ paths with .miniagent/skills/
+            skill_content = skill_content.replace(".workbuddy/skills/", ".miniagent/skills/")
+            skill_content = skill_content.replace(".workbuddy\\skills\\", ".miniagent\\skills\\")
 
             skill_root = skill_file.parent  # absolute path to the skill directory
 

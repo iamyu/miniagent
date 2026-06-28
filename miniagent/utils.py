@@ -2,20 +2,112 @@
 
 import json
 import logging
+import os
+import sys
+from pathlib import Path
 
 # Module-level logger
 logger = logging.getLogger("miniagent")
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.WARNING)
 
-# Add a console handler if none exists
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setLevel(logging.DEBUG)
-    handler.setFormatter(logging.Formatter(
+# Console handler (WARNING level by default)
+_console_handler: logging.StreamHandler | None = None
+# File handler for debug output
+_file_handler: logging.FileHandler | None = None
+
+
+def _init_handlers():
+    global _console_handler
+    if not logger.handlers:
+        _console_handler = logging.StreamHandler(sys.stderr)
+        _console_handler.setLevel(logging.WARNING)
+        _console_handler.setFormatter(logging.Formatter(
+            "[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+        logger.addHandler(_console_handler)
+
+
+_init_handlers()
+
+
+def enable_debug(log_dir: str | Path | None = None):
+    """Enable debug-level logging for the miniagent logger.
+
+    Debug messages are written to a single debug.log file under the
+    given directory (default: ~/.miniagent/).  Console output remains at
+    WARNING level so the TUI stays clean.
+
+    Args:
+        log_dir: Directory for log files (default: ~/.miniagent/).
+    """
+    from .config import get_app_dir
+
+    global _file_handler
+    _console_handler and _console_handler.setLevel(logging.WARNING)
+
+    # Remove old file handler if any
+    if _file_handler is not None:
+        logger.removeHandler(_file_handler)
+        _file_handler.close()
+        _file_handler = None
+
+    # File output for debug — one unified log file
+    d = Path(log_dir) if log_dir else get_app_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    log_path = d / "debug.log"
+    _file_handler = logging.FileHandler(str(log_path), encoding="utf-8")
+    _file_handler.setLevel(logging.DEBUG)
+    _file_handler.setFormatter(logging.Formatter(
         "[%(asctime)s] %(levelname)s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
+        datefmt="%Y-%m-%d %H:%M:%S",
     ))
-    logger.addHandler(handler)
+    logger.addHandler(_file_handler)
+
+    logger.setLevel(logging.DEBUG)
+    logger.info("Debug logging enabled -> %s", _file_handler.baseFilename)
+
+
+def switch_debug_session(session_id: str):
+    """Switch debug log output to a per-session log file.
+
+    Each conversation session gets its own debug log file:
+    debug_{session_id}.log under the same log directory.
+
+    If debug logging is not enabled (--debug not passed), this is a no-op.
+    Called by ChatEngine.new_session() and switch_to_session().
+    """
+    global _file_handler
+
+    if _file_handler is None:
+        # Debug logging not enabled; nothing to switch
+        return
+
+    from .config import get_app_dir
+
+    # Determine log directory from the current handler's file path
+    log_dir = Path(_file_handler.baseFilename).parent
+
+    # Remove and close old handler
+    logger.removeHandler(_file_handler)
+    _file_handler.close()
+
+    # Create per-session log file
+    log_path = log_dir / f"debug_{session_id}.log"
+    _file_handler = logging.FileHandler(str(log_path), encoding="utf-8")
+    _file_handler.setLevel(logging.DEBUG)
+    _file_handler.setFormatter(logging.Formatter(
+        "[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logger.addHandler(_file_handler)
+
+    logger.info("Session log -> %s (session: %s)", log_path.name, session_id)
+
+
+# Auto-enable debug via environment variable
+if os.environ.get("MINIAGENT_DEBUG", "").strip() in ("1", "true", "yes"):
+    enable_debug()
 
 
 def sanitize_tool_arguments(arguments_str: str, tool_name: str = "unknown") -> str:

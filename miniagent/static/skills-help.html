@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Skills 使用帮助 - MiniAgent</title>
+    <style>
+        :root {
+            --bg-primary: #f5f6f8;
+            --bg-secondary: #edeff2;
+            --bg-card: #ffffff;
+            --border: #e0e3e8;
+            --primary: #5b5fc7;
+            --primary-light: rgba(91, 95, 199, 0.08);
+            --text: #242424;
+            --text-secondary: #616161;
+            --text-muted: #999;
+            --success: #10b981;
+            --warning: #d97706;
+            --danger: #e17055;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans SC", sans-serif;
+            background: var(--bg-primary);
+            color: var(--text);
+            line-height: 1.7;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 960px;
+            margin: 0 auto;
+            padding: 40px 24px 80px;
+        }
+
+        .back-link {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-size: 14px;
+            margin-bottom: 32px;
+            transition: color 0.2s;
+        }
+        .back-link:hover { color: var(--primary); }
+        .back-link svg { width: 16px; height: 16px; }
+
+        h1 {
+            font-size: 32px;
+            font-weight: 700;
+            margin-bottom: 8px;
+            background: linear-gradient(135deg, #7c5ce7, #5b5fc7);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .subtitle {
+            font-size: 14px;
+            color: var(--text-secondary);
+            margin-bottom: 40px;
+        }
+
+        /* Section */
+        .section {
+            margin-bottom: 48px;
+        }
+        .section h2 {
+            font-size: 20px;
+            color: var(--text);
+            margin-bottom: 16px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .section h2 .icon {
+            width: 24px;
+            height: 24px;
+            color: var(--primary);
+        }
+
+        /* Skill cards */
+        .skill-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 16px;
+        }
+        .skill-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px;
+            transition: border-color 0.2s, transform 0.2s;
+        }
+        .skill-card:hover {
+            border-color: var(--primary);
+            transform: translateY(-2px);
+        }
+        .skill-card .skill-name {
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--primary);
+            margin-bottom: 6px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .skill-card .skill-triggers {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            margin-bottom: 10px;
+        }
+        .skill-card .trigger-tag {
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 10px;
+            background: var(--primary-light);
+            color: var(--primary);
+            border: 1px solid rgba(91, 95, 199, 0.25);
+        }
+        .skill-card .skill-desc {
+            font-size: 13px;
+            color: var(--text-secondary);
+            line-height: 1.5;
+        }
+        .skill-card .skill-src {
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px solid var(--border);
+        }
+
+        /* Code blocks */
+        .code-block {
+            background: #f0f1f5;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px 20px;
+            margin: 12px 0;
+            overflow-x: auto;
+            font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", monospace;
+            font-size: 13px;
+            line-height: 1.6;
+            color: #333;
+        }
+        .code-block .comment { color: #999; }
+        .code-block .keyword { color: #7c5ce7; }
+        .code-block .path { color: #b85c1a; }
+        .code-block .value { color: #0e8a5e; }
+
+        /* Steps */
+        .step-list {
+            list-style: none;
+            counter-reset: step;
+        }
+        .step-list li {
+            counter-increment: step;
+            position: relative;
+            padding-left: 40px;
+            margin-bottom: 16px;
+        }
+        .step-list li::before {
+            content: counter(step);
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 26px;
+            height: 26px;
+            border-radius: 50%;
+            background: var(--primary-light);
+            border: 1px solid var(--primary);
+            color: var(--primary);
+            font-size: 13px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .step-list li strong {
+            display: block;
+            margin-bottom: 4px;
+            color: var(--text);
+        }
+        .step-list li p {
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+
+        /* Info box */
+        .info-box {
+            background: var(--primary-light);
+            border: 1px solid rgba(91, 95, 199, 0.25);
+            border-radius: 8px;
+            padding: 14px 18px;
+            font-size: 13px;
+            margin: 16px 0;
+        }
+        .info-box.tip { border-color: rgba(0, 184, 148, 0.35); background: rgba(0, 184, 148, 0.08); }
+        .info-box.tip::before { content: "💡 提示："; color: var(--success); font-weight: 600; }
+
+        .info-box.warn { border-color: rgba(253, 203, 110, 0.35); background: rgba(253, 203, 110, 0.08); }
+        .info-box.warn::before { content: "⚠ 注意："; color: var(--warning); font-weight: 600; }
+
+        .usage-methods {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+            gap: 16px;
+            margin: 16px 0;
+        }
+        .usage-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 18px;
+        }
+        .usage-card .usage-title {
+            font-size: 15px;
+            font-weight: 600;
+            color: var(--text);
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .usage-card .usage-title .badge {
+            font-size: 11px;
+            padding: 1px 8px;
+            border-radius: 8px;
+            background: var(--primary);
+            color: #fff;
+        }
+        .usage-card p {
+            font-size: 13px;
+            color: var(--text-secondary);
+            line-height: 1.5;
+        }
+
+        /* Responsive */
+        @media (max-width: 640px) {
+            .container { padding: 24px 16px 60px; }
+            h1 { font-size: 24px; }
+            .skill-grid { grid-template-columns: 1fr; }
+            .usage-methods { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+
+    <a href="/" class="back-link">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>
+        </svg>
+        返回首页
+    </a>
+
+    <h1>Skills 使用帮助</h1>
+    <p class="subtitle">了解 MiniAgent 内置技能的使用场景、触发方式，以及如何扩展自定义技能</p>
+
+    <!-- 什么是 Skills -->
+    <div class="section">
+        <h2>
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>
+            </svg>
+            什么是 Skills
+        </h2>
+        <p style="font-size:14px;color:var(--text-secondary);margin-bottom:12px;">
+            Skills 是 MiniAgent 的技能模块，每个 Skill 是一组专业的指令和工具，用于完成特定领域的任务。
+            当你发送消息时，Agent 会智能匹配相关技能并自动加载，让模型获得对应领域的专业能力。
+        </p>
+    </div>
+
+    <!-- 如何使用 -->
+    <div class="section">
+        <h2>
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
+            </svg>
+            如何使用 Skills
+        </h2>
+
+        <div class="usage-methods">
+            <div class="usage-card">
+                <div class="usage-title">
+                    <span class="badge">方式1</span> 底部对话框左边
+                </div>
+                <p>点击输入框左侧的 <strong><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg> Skills 图标</strong>，在弹出面板中勾选需要的 Skill，然后输入你的请求。指定Skill是最精准的使用方式，但需要你对技能有一定的了解。</p>
+            </div>
+            <div class="usage-card">
+                <div class="usage-title">
+                    <span class="badge">方式2</span> @ 调用
+                </div>
+                <p>在输入框中使用 <code style="color:var(--primary);background:var(--primary-light);padding:1px 6px;border-radius:4px;">@技能名</code> 显式指定要使用的 Skill。例如 <code style="color:var(--primary);background:var(--primary-light);padding:1px 6px;border-radius:4px;">@docx 帮我写一份Word报告。@shell-pptx 用 Shell 风格做一个用户操作手册PPT</code></p>
+            </div>
+            <div class="usage-card">
+                <div class="usage-title">
+                    <span class="badge">方式3</span> 自动匹配
+                </div>
+                <p>直接在对话中输入自然语言内容，Agent 会根据关键词自动匹配相关 Skill。例如发送「帮我做一个PPT」会自动激活 PPT 相关技能。</p>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- 工作文件夹与输入文件 -->
+    <div class="section">
+        <h2>
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+            </svg>
+            工作文件夹与输入文件
+        </h2>
+        <p style="font-size:14px;color:var(--text-secondary);margin-bottom:16px;">
+            使用技能处理文档时，需要将待处理的文件放入项目的工作文件夹中。
+        </p>
+
+        <div class="info-box tip">
+            项目的工作文件夹位于项目根目录下的 <code style="color:var(--primary);background:var(--primary-light);padding:1px 6px;border-radius:4px;">output/</code> 目录。所有输入文件和生成的文件都统一存放在这个文件夹里。
+        </div>
+
+        <h3 style="font-size:16px;color:var(--text);margin-top:24px;margin-bottom:12px;">操作步骤</h3>
+        <ol class="step-list">
+            <li>
+                <strong>放入待处理的文件</strong>
+                <p>在 MiniAgent 的项目根目录下找到 <code style="color:var(--primary);background:var(--primary-light);padding:1px 6px;border-radius:4px;">output/</code> 文件夹，将你需要处理的所有文件（如 .docx、.pdf、.pptx、图片等）放入该目录。</p>
+            </li>
+            <li>
+                <strong>在对话中引用文件</strong>
+                <p>你可以直接告诉 Agent 要处理的文件名，或者点击输入框右侧的 <strong><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg> 回形针按钮</strong> 浏览选择 <code style="color:var(--primary);background:var(--primary-light);padding:1px 6px;border-radius:4px;">output/</code> 目录下的文件（浏览功能仅限本项目文件夹内的文件）。对于项目外的文件，请在文件管理器中复制完整路径，粘贴到回形针弹窗输入框后点击「插入」按钮即可。例如：「把 报告.docx 转成 PDF」</p>
+            </li>
+            <li>
+                <strong>获取生成结果</strong>
+                <p>Agent 处理完成后，生成的文件也会输出到 <code style="color:var(--primary);background:var(--primary-light);padding:1px 6px;border-radius:4px;">output/</code> 文件夹中，你可以直接在该目录下找到处理后的文件。</p>
+            </li>
+        </ol>
+
+    </div>
+
+    <!-- 内置技能列表 -->
+    <div class="section">
+        <h2>
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>
+            </svg>
+            内置技能列表
+        </h2>
+
+        <div class="skill-grid">
+
+            <div class="skill-card">
+                <div class="skill-name">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                    docx
+                </div>
+                <div class="skill-triggers">
+                    <span class="trigger-tag">Word文档</span>
+                    <span class="trigger-tag">.docx</span>
+                    <span class="trigger-tag">md2docx</span>
+                    <span class="trigger-tag">报告</span>
+                    <span class="trigger-tag">备忘录</span>
+                </div>
+                <div class="skill-desc">创建、读取、编辑 Word 文档。支持目录、标题、页码、页眉等格式化功能，Markdown 转 Word，插入图片，处理修订标记与批注。</div>
+            </div>
+
+            <div class="skill-card">
+                <div class="skill-name">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                    pdf
+                </div>
+                <div class="skill-triggers">
+                    <span class="trigger-tag">PDF</span>
+                    <span class="trigger-tag">.pdf文件</span>
+                </div>
+                <div class="skill-desc">读取/提取 PDF 中的文本和表格，合并/拆分 PDF，旋转页面，添加水印，创建新 PDF，填写 PDF 表单，加密/解密，提取图片，OCR 识别。</div>
+            </div>
+
+            <div class="skill-card">
+                <div class="skill-name">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="16" rx="2"/><line x1="6" y1="8" x2="18" y2="8"/><line x1="6" y1="12" x2="18" y2="12"/><line x1="6" y1="16" x2="12" y2="16"/></svg>
+                    pptx
+                </div>
+                <div class="skill-triggers">
+                    <span class="trigger-tag">PPT</span>
+                    <span class="trigger-tag">幻灯片</span>
+                    <span class="trigger-tag">deck</span>
+                    <span class="trigger-tag">presentation</span>
+                    <span class="trigger-tag">.pptx</span>
+                </div>
+                <div class="skill-desc">创建/编辑 PowerPoint 演示文稿。支持模板、布局、母版、演讲者备注、批注，合并拆分幻灯片文件，以及 .pptx 文件的读取解析。</div>
+            </div>
+
+            <div class="skill-card">
+                <div class="skill-name">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="14 2 18 6 20 10 14 6"/><path d="M11 21l-8-8 6-6"/></svg>
+                    html-ppt
+                </div>
+                <div class="skill-triggers">
+                    <span class="trigger-tag">PPT</span>
+                    <span class="trigger-tag">演示文稿</span>
+                    <span class="trigger-tag">演讲稿</span>
+                    <span class="trigger-tag">keynote</span>
+                    <span class="trigger-tag">slideshow</span>
+                    <span class="trigger-tag">技术分享</span>
+                    <span class="trigger-tag">小红书图文</span>
+                </div>
+                <div class="skill-desc">HTML PPT 工作室：使用模板驱动方式创作精美的 HTML 演示文稿。支持多种风格主题、丰富布局和动画效果，输出为可键盘翻页的静态 HTML 文件。</div>
+            </div>
+
+            <div class="skill-card">
+                <div class="skill-name">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+                    frontend-slides
+                </div>
+                <div class="skill-triggers">
+                    <span class="trigger-tag">演示文稿</span>
+                    <span class="trigger-tag">PPT转网页</span>
+                    <span class="trigger-tag">演讲</span>
+                    <span class="trigger-tag">路演</span>
+                    <span class="trigger-tag">slides</span>
+                </div>
+                <div class="skill-desc">创建动画丰富的 HTML 演示文稿，支持从零创建或从 PowerPoint 文件转换。基于 beautiful-html-templates 模板库，适合需要丰富视觉效果的展示场景。</div>
+            </div>
+
+            <div class="skill-card">
+                <div class="skill-name">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H8"/><line x1="12" y1="18" x2="12" y2="22"/></svg>
+                    markitdown
+                </div>
+                <div class="skill-triggers">
+                    <span class="trigger-tag">转换格式</span>
+                    <span class="trigger-tag">Markdown</span>
+                </div>
+                <div class="skill-desc">通用文件格式转换工具，将 PDF、DOCX、PPTX、XLSX、图片（OCR）、音频（语音转文字）、HTML、CSV、JSON、XML、ZIP、EPub 等多种格式转换为 Markdown。</div>
+            </div>
+
+            <div class="skill-card">
+                <div class="skill-name">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="16" rx="2"/><line x1="6" y1="8" x2="18" y2="8"/><line x1="6" y1="12" x2="18" y2="12"/><line x1="6" y1="16" x2="12" y2="16"/></svg>
+                    shell-pptx
+                </div>
+                <div class="skill-triggers">
+                    <span class="trigger-tag">Shell PPT</span>
+                    <span class="trigger-tag">品牌风格</span>
+                    <span class="trigger-tag">Shell风格</span>
+                </div>
+                <div class="skill-desc">Shell 品牌风格 PPT 生成器，基于 HTML-to-PPTX 工作流。适用于 Shell 相关项目中使用统一品牌色的演示文稿制作。</div>
+            </div>
+
+            <div class="skill-card">
+                <div class="skill-name">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+                    tech-debt-assessment
+                </div>
+                <div class="skill-triggers">
+                    <span class="trigger-tag">技术债</span>
+                    <span class="trigger-tag">代码质量</span>
+                    <span class="trigger-tag">重构</span>
+                    <span class="trigger-tag">tech debt</span>
+                    <span class="trigger-tag">code quality</span>
+                </div>
+                <div class="skill-desc">技术债评估分析：扫描代码库中的技术债务问题，生成结构化的评估报告和改进建议，帮助团队识别重构优先级。</div>
+            </div>
+
+        </div>
+    </div>
+
+    <!-- 自定义 Skill -->
+    <div class="section">
+        <h2>
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/>
+            </svg>
+            扩展自定义 Skill
+        </h2>
+
+        <p style="font-size:14px;color:var(--text-secondary);margin-bottom:16px;">
+            MiniAgent 支持用户自定义 Skill，你可以根据自己的需求编写专业领域的技能模块。
+        </p>
+
+        <h3 style="font-size:16px;color:var(--text);margin-top:24px;margin-bottom:12px;">Skill 存放路径</h3>
+
+        <div class="info-box">
+            自定义 Skill 可以放在以下任意一个位置（按优先级排列）：
+        </div>
+
+        <ol class="step-list">
+             <li>
+                <strong>项目目录下的 skills 文件夹</strong>
+                <p>放置在 MiniAgent 项目根目录的 <code style="color:var(--primary);background:var(--primary-light);padding:1px 6px;border-radius:4px;">skills/</code> 目录下。这是项目的预制 Skills 目录，随项目一起分发，都经过测试能够正常使用。</p>
+            </li>
+            <li>
+                <strong>用户home目录下(C:\Users\你的用户名\.miniagent)的 skills 文件夹</strong>
+                <p>放置在 <code style="color:var(--primary);background:var(--primary-light);padding:1px 6px;border-radius:4px;">~/.miniagent/skills/</code> 目录下。这是用户个人专属的 Skills 目录，不会被项目更新影响。</p>
+            </li>
+        </ol>
+
+    </div>
+
+</div>
+</body>
+</html>

@@ -8,7 +8,12 @@ from pathlib import Path
 def cmd_chat(args) -> None:
     """Interactive chat mode."""
     from .chat import ChatEngine
-    from .config import load_config, get_config_path, get_app_dir
+    from .config import load_config, get_config_path, get_skills_dir
+    from .utils import enable_debug
+
+    # Enable debug logging early
+    if args.debug:
+        enable_debug()
 
     # Load config
     project_config = Path(args.config) if args.config else None
@@ -37,7 +42,7 @@ def cmd_chat(args) -> None:
     print()
     print(f"  MiniAgent v1.1.0")
     print(f"  Model: {config.get('model', 'qwen-plus')}")
-    print(f"  Skills dir: {config.get('skills_dir') or str(get_app_dir() / 'skills')}")
+    print(f"  Skills dir: {config.get('skills_dir') or str(get_skills_dir(config))}")
 
     # Tools
     tool_names = engine.tools.tool_names
@@ -178,6 +183,11 @@ def cmd_web(args) -> None:
     import uvicorn
     from .web import app
     from .config import load_config
+    from .utils import enable_debug
+
+    # Enable debug logging early
+    if args.debug:
+        enable_debug()
 
     config = load_config()
 
@@ -214,6 +224,11 @@ def main():
         help="One-shot query mode: send a message and print the response, then exit",
         default=None,
     )
+    chat_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging (LLM responses, shell commands, etc.)",
+    )
 
     # web subcommand
     web_parser = sub.add_parser("web", help="Start web server with UI")
@@ -227,6 +242,11 @@ def main():
         help="Port to bind (default: 7860)",
         type=int,
         default=None,
+    )
+    web_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging (LLM responses, shell commands, etc.)",
     )
 
     # skills subcommand

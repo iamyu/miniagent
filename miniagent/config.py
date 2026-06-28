@@ -23,6 +23,7 @@ DEFAULT_CONFIG = {
     "temperature": 0.7,
     "max_tokens": 32768,
     "max_history": 20,
+    "max_tool_history": 20,
     "system_prompt": "你是一个有帮助的 AI 助手。请用中文回答问题。",
     "skills_dir": None,
 }
@@ -90,9 +91,17 @@ def load_config(project_config: Path | None = None) -> dict[str, Any]:
 
 
 def get_skills_dir(config: dict[str, Any]) -> Path:
-    """Return the skills directory path."""
+    """Return the skills directory path with priority:
+    1. Explicit config.skills_dir
+    2. <project_root>/skills/ (if exists)
+    3. ~/.miniagent/skills/
+    """
     if config.get("skills_dir"):
         return Path(config["skills_dir"]).expanduser()
+    # Check project root's skills/ directory first
+    project_skills = _project_root / "skills"
+    if project_skills.exists():
+        return project_skills
     return get_app_dir() / "skills"
 
 

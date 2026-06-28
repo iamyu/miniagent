@@ -14,6 +14,10 @@ const state = {
     wsReconnectAttempts: 0,  // track reconnection attempts
     wsMaxReconnectDelay: 30000,  // max 30s between retries
     attachedFiles: [],  // [{name, path}]
+    // Unified content stream: text blocks and tool cards interleave in arrival order
+    streamMode: 'text',           // 'text' | 'tool'
+    currentTextBlock: null,       // DOM element for current text paragraph
+    currentBlockStartIdx: 0,      // index into content where current block starts
 };
 
 const API_BASE = '';
@@ -101,14 +105,32 @@ function handleWSMessage(msg) {
             state.currentAssistant = { content: '', tools: [] };
             appendAssistantBubble();
         }
+        // Start a new text paragraph when switching back from tool mode
+        if (state.streamMode !== 'text' || !state.currentTextBlock) {
+            const stream = document.getElementById('current-assistant-stream');
+            if (stream) {
+                // Remove typing indicator on first text
+                const dots = stream.querySelector('.typing-indicator');
+                if (dots) dots.remove();
+                const block = document.createElement('div');
+                block.className = 'stream-text';
+                stream.appendChild(block);
+                state.currentTextBlock = block;
+                state.currentBlockStartIdx = state.currentAssistant.content.length;
+                state.streamMode = 'text';
+            }
+        }
         state.currentAssistant.content += msg.content;
-        updateAssistantBubble(state.currentAssistant.content);
+        _scheduleBubbleRender();
     }
     else if (type === 'tool_start') {
         if (!state.currentAssistant) {
             state.currentAssistant = { content: '', tools: [] };
             appendAssistantBubble();
         }
+        // Switch to tool mode: end current text paragraph
+        state.streamMode = 'tool';
+        state.currentTextBlock = null;
         const toolEntry = {
             name: msg.name, args: msg.args,
             result: null, done: false, truncated: false
@@ -504,20 +526,32 @@ function clearChatUI() {
             <p>轻量级 AI Agent，支持 Skills + Tools，帮你完成各种任务</p>
             <div class="welcome-features">
                 <div class="feature-card" data-action="file">
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-                    <span>文件操作</span>
+                    <div class="feature-default">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                        <span>文件操作</span>
+                    </div>
+                    <div class="feature-desc">读写、搜索、编辑本地文件，支持拖拽上传与批量处理</div>
                 </div>
                 <div class="feature-card" data-action="code">
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
-                    <span>代码执行</span>
+                    <div class="feature-default">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+                        <span>代码执行</span>
+                    </div>
+                    <div class="feature-desc">运行 Python / Shell 命令，实时查看执行结果与错误输出</div>
                 </div>
                 <div class="feature-card" data-action="ai">
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-                    <span>AI 对话</span>
+                    <div class="feature-default">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                        <span>AI 对话</span>
+                    </div>
+                    <div class="feature-desc">支持多模型、流式输出，结合 Tools 与 Skills 完成复杂任务</div>
                 </div>
                 <div class="feature-card" data-action="skills">
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
-                    <span>Skills</span>
+                    <div class="feature-default">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+                        <span>Skills</span>
+                    </div>
+                    <div class="feature-desc">使用预置Word，PPT，HTML等Skills，支持自定义 Skill 实现专业领域任务<a href="/static/skills-help.html" class="feature-help-link" onclick="event.stopPropagation()">📖 帮助</a></div>
                 </div>
             </div>
         </div>
@@ -526,8 +560,18 @@ function clearChatUI() {
     container.querySelectorAll('.feature-card').forEach(card => {
         card.addEventListener('click', () => {
             const action = card.dataset.action;
-            if (action === 'skills') switchView('skills');
-            else switchView('chat');
+            if (action === 'ai') switchView('chat');
+            else if (action === 'skills') switchView('skills');
+            else if (action === 'file') {
+                switchView('chat');
+                document.getElementById('chat-input').value = '读取当前目录的文件列表';
+                document.getElementById('chat-input').focus();
+            }
+            else if (action === 'code') {
+                switchView('chat');
+                document.getElementById('chat-input').value = '用 Python 写一个 Hello World';
+                document.getElementById('chat-input').focus();
+            }
         });
     });
 }
@@ -550,6 +594,9 @@ function appendAssistantBubble() {
     // Reset streaming render state for new message
     _lastRenderedLen = 0;
     _renderScheduled = false;
+    state.streamMode = 'text';
+    state.currentTextBlock = null;
+    state.currentBlockStartIdx = 0;
     const container = document.getElementById('chat-messages');
     const div = document.createElement('div');
     div.className = 'message assistant';
@@ -557,14 +604,13 @@ function appendAssistantBubble() {
     div.innerHTML = `
         <div class="message-avatar">M</div>
         <div class="message-content">
-            <div id="current-assistant-text">
+            <div class="content-stream" id="current-assistant-stream">
                 <div class="typing-indicator">
                     <div class="typing-dot"></div>
                     <div class="typing-dot"></div>
                     <div class="typing-dot"></div>
                 </div>
             </div>
-            <div id="current-tool-cards"></div>
             <div id="processing-indicator" class="processing-indicator" style="display:none"></div>
         </div>
     `;
@@ -594,29 +640,40 @@ let _renderScheduled = false;
  * rAF throttling batches all chunks within one ~16ms frame into a
  * single render, while still keeping the output visually smooth.
  */
-function _scheduleBubbleRender(el) {
+function _scheduleBubbleRender() {
     if (_renderScheduled) return;
     _renderScheduled = true;
     requestAnimationFrame(() => {
         _renderScheduled = false;
-        const content = state.currentAssistant?.content || '';
-        // Skip if nothing rendered yet (typing indicator still showing)
-        if (!content) return;
-        // Skip if no new content since last render — avoid wasted work
-        // when multiple tool messages arrive but no text was added
-        if (content.length <= _lastRenderedLen) return;
+        const el = state.currentTextBlock;
+        if (!el) return;
+        const fullContent = state.currentAssistant?.content || '';
+        const delta = fullContent.substring(state.currentBlockStartIdx);
+        if (!delta) return;
 
-        const nearBottom = isUserNearBottom();
-        el.innerHTML = formatMessageContent(content);
-        _lastRenderedLen = content.length;
-        if (nearBottom) scrollToBottom(true);
+        el.innerHTML = formatMessageContent(delta);
+        // During active streaming, always auto-scroll so user sees latest content.
+        if (state.isStreaming) scrollToBottom(true);
     });
 }
 
 function updateAssistantBubble(content) {
-    const el = document.getElementById('current-assistant-text');
-    if (el) {
-        _scheduleBubbleRender(el);
+    // For HTTP fallback: create a text block if one doesn't exist yet
+    if (!state.currentTextBlock) {
+        const stream = document.getElementById('current-assistant-stream');
+        if (stream) {
+            const dots = stream.querySelector('.typing-indicator');
+            if (dots) dots.remove();
+            const block = document.createElement('div');
+            block.className = 'stream-text';
+            stream.appendChild(block);
+            state.currentTextBlock = block;
+            state.currentBlockStartIdx = 0;
+            state.streamMode = 'text';
+        }
+    }
+    if (state.currentTextBlock) {
+        _scheduleBubbleRender();
     }
     // Reset render tracker when a new message starts (content shorter = new message)
     if (content.length < _lastRenderedLen) {
@@ -625,8 +682,8 @@ function updateAssistantBubble(content) {
 }
 
 function appendToolCard(name, args, idx) {
-    const container = document.getElementById('current-tool-cards');
-    if (!container) return;
+    const stream = document.getElementById('current-assistant-stream');
+    if (!stream) return;
     // Dedup: skip if card already exists
     if (document.getElementById(`tool-card-${idx}`)) return;
     const argsStr = (args && typeof args === 'object')
@@ -636,7 +693,7 @@ function appendToolCard(name, args, idx) {
     card.className = 'tool-card expanded';
     card.id = `tool-card-${idx}`;
     card.innerHTML = `
-        <div class="tool-card-header">
+        <div class="tool-card-header" onclick="toggleToolCard(${idx})">
             <span class="tool-icon">&#9881;</span>
             <span class="tool-name">${escapeHtml(name)}</span>
             <span class="tool-status running" id="tool-status-${idx}">生成参数中...</span>
@@ -645,10 +702,10 @@ function appendToolCard(name, args, idx) {
             <div class="tool-args" id="tool-args-${idx}">${escapeHtml(argsStr)}</div>
         </div>
     `;
-    // Check BEFORE appending — only scroll if user hasn't scrolled up
+    // During streaming, always auto-scroll so the latest tool card stays visible.
     const nearBottom = isUserNearBottom();
-    container.appendChild(card);
-    if (nearBottom) scrollToBottom(true);
+    stream.appendChild(card);
+    if (nearBottom || state.isStreaming) scrollToBottom(true);
 }
 
 // Stream args text into an existing tool card in real-time
@@ -693,13 +750,15 @@ function updateToolCard(toolInfo, idx) {
         let html = `<div class="tool-result-label">Result:</div>`;
         html += `<div class="tool-result" id="tool-result-${idx}">${escapeHtml(fullResult)}</div>`;
         body.innerHTML += html;
+        // Keep tool result visible — large results push the card upwards
+        if (state.isStreaming) scrollToBottom(true);
     }
 }
 
 function finalizeAssistantMessage() {
     if (state.currentAssistant) {
         // Clean up transitional status phrases from LLM output (e.g. "正在生成文件...")
-        const textEl = document.getElementById('current-assistant-text');
+        const textEl = state.currentTextBlock;
         if (state.currentAssistant.content) {
             state.currentAssistant.content = state.currentAssistant.content
                 .replace(/\*{0,2}正在(生成|执行|处理|保存|写入|创建|准备)[^\n]*\.{3,}\*{0,2}\s*\n?/g, '')
@@ -707,22 +766,32 @@ function finalizeAssistantMessage() {
         }
 
         // If no text content was generated but tools were executed, show a summary
-        if (textEl && !state.currentAssistant.content && state.currentAssistant.tools.length > 0) {
+        const stream = document.getElementById('current-assistant-stream');
+        if (stream && !state.currentAssistant.content && state.currentAssistant.tools.length > 0) {
             const doneCount = state.currentAssistant.tools.filter(t => t.done).length;
             const toolNames = state.currentAssistant.tools.map(t => t.name).join(', ');
             const summary = `✓ 通过 ${toolNames} 完成了 ${doneCount} 个工具调用`;
             state.currentAssistant.content = summary;
-            textEl.innerHTML = `<p>${escapeHtml(summary)}</p>`;
+            const summaryBlock = document.createElement('div');
+            summaryBlock.className = 'stream-text';
+            summaryBlock.innerHTML = `<p>${escapeHtml(summary)}</p>`;
+            // Insert at the beginning of stream (before tool cards)
+            if (stream.firstChild) {
+                stream.insertBefore(summaryBlock, stream.firstChild);
+            } else {
+                stream.appendChild(summaryBlock);
+            }
         }
 
-        const el = document.getElementById('current-assistant-msg');
-        if (el) el.removeAttribute('id');
-        if (textEl) textEl.removeAttribute('id');
-        const tools = document.getElementById('current-tool-cards');
-        if (tools) tools.removeAttribute('id');
+        const msgEl = document.getElementById('current-assistant-msg');
+        if (msgEl) msgEl.removeAttribute('id');
+        if (stream) stream.removeAttribute('id');
         hideProcessing();
     }
     state.currentAssistant = null;
+    state.currentTextBlock = null;
+    state.streamMode = 'text';
+    state.currentBlockStartIdx = 0;
     state.isStreaming = false;
     hideProcessing();
     updateSendBtn();
@@ -1504,6 +1573,18 @@ function showProcessing(text) {
     }
 }
 
+function toggleToolCard(idx) {
+    const card = document.getElementById(`tool-card-${idx}`);
+    if (!card) return;
+    card.classList.toggle('expanded');
+    // Save scroll position so layout doesn't jump away from user
+    const container = document.getElementById('chat-messages');
+    const scrollTopBefore = container ? container.scrollTop : 0;
+    requestAnimationFrame(() => {
+        if (container) container.scrollTop = scrollTopBefore;
+    });
+}
+
 function hideProcessing() {
     const container = document.getElementById('processing-indicator');
     if (container) {
@@ -1561,7 +1642,10 @@ async function loadHistory() {
                      title="${escapeAttr(session.first_message || title)}">
                     <div class="history-item-user">${escapeHtml(title)}</div>
                     <div class="history-item-preview">${escapeHtml(truncateText(session.first_message || '', 40))}</div>
-                    <div class="history-item-time">${formatTime(session.updated_at)} · ${session.message_count || 0}条</div>
+                    <div class="history-item-time">
+                        ${formatTime(session.updated_at)} · ${session.message_count || 0}条
+                        ${(session.total_tokens > 0) ? `<span class="history-item-tokens"> · ${formatTokens(session.total_tokens)}</span>` : ''}
+                    </div>
                     <button class="history-delete-btn" title="删除此对话" data-sid="${escapeAttr(session.session_id)}">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <polyline points="3 6 5 6 21 6"/>
@@ -1741,6 +1825,14 @@ async function loadSession(sessionId) {
 function truncateText(text, maxLength) {
     if (!text) return '';
     return text.length > maxLength ? text.substring(0, maxLength) + '...' : text;
+}
+
+function formatTokens(totalTokens) {
+    if (!totalTokens || totalTokens <= 0) return '';
+    if (totalTokens < 1000) return totalTokens + ' tokens';
+    const k = (totalTokens / 1000).toFixed(1);
+    // Remove trailing .0
+    return (k.endsWith('.0') ? k.slice(0, -2) : k) + 'K tokens';
 }
 
 function formatTime(timestamp) {

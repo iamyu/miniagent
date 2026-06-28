@@ -153,7 +153,9 @@ class SkillsLoader:
             parts.append(
                 f"### Skill: {s.name}\n"
                 f"**Skill root directory:** {skill_root}\n"
-                f"(All relative paths in this skill's instructions refer to this directory.)\n\n"
+                f"(All relative paths and any paths referencing other tool ecosystems "
+                f"(e.g. .workbuddy/, .claude/) in this skill's instructions "
+                f"should be replaced with: {skill_root})\n\n"
                 f"{s.content}"
             )
         return "\n\n---\n\n".join(parts)

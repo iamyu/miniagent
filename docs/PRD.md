@@ -5,9 +5,9 @@
 | Field | Value |
 |-------|-------|
 | **Product Name** | MiniAgent |
-| **Version** | 1.1.0 |
-| **Document Version** | 1.0 |
-| **Last Updated** | 2026-05-17 |
+| **Version** | 1.2.0 |
+| **Document Version** | 1.1 |
+| **Last Updated** | 2026-06-28 |
 | **Status** | Released |
 | **Author** | MiniAgent Development Team |
 
@@ -147,25 +147,29 @@ Detailed instructions, rules, and context for the AI...
 | `write_file` | Create or overwrite files | Report generation, data export |
 | `edit_file` | Partial file editing | Code refactoring, content updates |
 | `list_dir` | List directory contents | File exploration, project navigation |
-| `shell` | Execute CMD commands | System operations, batch processing |
+| `shell` | Execute shell commands (PowerShell on Windows) | System operations, batch processing |
 | `run_node` | Execute Node.js scripts/code | JavaScript automation, build tasks |
 | `run_python` | Execute Python scripts/code | Data processing, scripting |
 | `web_search` | Search the web (DuckDuckGo) | Research, fact-checking |
 | `web_fetch` | Fetch and extract URL content | Web scraping, content aggregation |
 | `save_document` | Save generated documents | Persistent storage of outputs |
+| `find_skills` | Search locally installed skills | Discover relevant skills by keyword |
+| `use_skill` | Explicitly activate a skill by name | Load specific skill instructions |
 
 **Tool Execution Flow**:
 1. LLM identifies need for tool usage
 2. System calls appropriate tool with parameters
 3. Tool executes and returns result
 4. Result fed back to LLM for further processing
-5. Loop continues until task complete (max 10 rounds)
+5. Loop continues until task complete (dynamic max rounds, estimated by task complexity)
+6. Consecutive failure detection: if a tool fails 3+ times consecutively, the loop breaks
 
 **Safety Features**:
 - Dangerous command blocking (format, del /s, etc.)
 - Timeout controls (default 30s, max 300s)
 - Output truncation for large results
 - Permission error handling
+- Consecutive failure detection and prevention of infinite retry loops
 
 **User Benefits**:
 - Real-world task automation
@@ -175,7 +179,30 @@ Detailed instructions, rules, and context for the AI...
 
 ---
 
-#### 3.1.4 Configuration Management
+#### 3.1.4 Skill Discovery Tools
+**Description**: Tools for programmatic skill discovery and activation
+
+**FindSkills Tool**:
+- **Purpose**: Search locally installed skills by keyword
+- **Parameters**: `query` (string) - keyword to search
+- **Search Scope**: Skill name, description, triggers, and full content
+- **Scoring**: name match (+100) > description match (+50) > trigger match (+30)
+- **Returns**: Matching skills sorted by relevance
+
+**UseSkill Tool**:
+- **Purpose**: Explicitly activate a skill by name
+- **Parameters**: `name` (string) - skill name
+- **Returns**: Full skill content (excluding YAML frontmatter)
+- **Path Compatibility**: Automatically replaces `.workbuddy/` with `.miniagent/`
+
+**Use Cases**:
+- Discover relevant skills for a task
+- Override auto-matching when needed
+- Load skill instructions explicitly
+
+---
+
+#### 3.1.5 Configuration Management
 **Description**: Flexible configuration system with cascading priority
 
 **Configuration Sources** (highest to lowest priority):
@@ -191,9 +218,10 @@ Detailed instructions, rules, and context for the AI...
   "api_key": "sk-xxxxx",
   "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
   "temperature": 0.7,
-  "max_tokens": 4096,
+  "max_tokens": 32768,
   "max_history": 20,
-  "system_prompt": "你是一个有帮助的 AI 助手。",
+  "max_tool_history": 20,
+  "system_prompt": "你是一个有帮助的 AI 助手。请用中文回答问题。",
   "skills_dir": null
 }
 ```
@@ -202,6 +230,10 @@ Detailed instructions, rules, and context for the AI...
 - `DASHSCOPE_API_KEY`: API authentication key
 - `DASHSCOPE_BASE_URL`: Custom API endpoint
 - `MINIAGENT_MODEL`: Override default model
+
+**Configuration File Support**:
+- Auto-loads `.env` file from project root (requires `python-dotenv`)
+- Cascading priority: project config > user config > .env > environment variables > defaults
 
 **User Benefits**:
 - Secure API key management
@@ -222,7 +254,14 @@ Detailed instructions, rules, and context for the AI...
 - `/tools` - List all available tools
 - `/reload` - Reload skills from disk
 - `/use <name>` - Manually activate a specific skill
+- `/sessions` - List all conversation sessions
+- `/new` - Start a new conversation session
+- `/switch <session_id>` - Switch to a specific session
+- `/history` - Show current session's history
 - `/quit` or `/exit` - Exit the application
+
+**Skill Activation Syntax**:
+- `@skill-name` - Activate a skill by name in the message (e.g., "@prd-writer write a PRD")
 
 **Features**:
 - Interactive REPL loop
@@ -326,18 +365,25 @@ The system prompt explicitly instructs the AI to save all generated documents to
 ---
 
 #### 3.3.3 Conversation History Management
-**Description**: Intelligent history tracking with automatic pruning
+**Description**: Intelligent history tracking with SQLite-based persistent storage
 
 **Features**:
 - Configurable history depth (default: 20 turns)
 - Automatic trimming when limit exceeded
 - Clean history (excludes tool call artifacts)
-- Persistent within session, cleared on restart
+- **Persistent storage in SQLite database** (`~/.miniagent/history.db`)
+- **Multi-session support**: Multiple conversation sessions with unique IDs
+- **Session management**: Auto-titling, session switching, session listing
+- Maintains context for coherent multi-turn conversations
 
 **Implementation**:
 - Stores only user and assistant messages
 - Excludes intermediate tool calls from long-term memory
 - Maintains context for coherent multi-turn conversations
+- Sessions are stored in `sessions` table with metadata
+- Messages are stored in `conversations` table with timestamps
+- Supports session switching via `switch_to_session(session_id)`
+- Supports new session creation via `new_session()`
 
 ---
 
@@ -364,6 +410,7 @@ The system prompt explicitly instructs the AI to save all generated documents to
           │  • Manage History      │
           │  • Call LLM API        │
           │  • Handle Tool Calls   │
+          │  • Multi-Session Mgmt  │
           └────┬───────┬───────┬───┘
                │       │       │
      ┌─────────▼─┐ ┌───▼────┐ ┌▼──────────┐
@@ -372,12 +419,21 @@ The system prompt explicitly instructs the AI to save all generated documents to
      │(skills.py)│ │(tools. │ │(config.py)│
      │           │ │ py)    │ │           │
      └───────────┘ └────────┘ └───────────┘
+          │              │              │
+     ┌────▼──────┐  ┌────▼────────┐    │
+     │ Skill     │  │ Built-in    │    │
+     │ Files     │  │ Tools       │    │
+     │(SKILL.md) │  │             │    │
+     └───────────┘  └─────────────┘    │
+          │              │              │
+          │     ┌────────▼───────────┐ │
+          │     │  Database          │ │
+          │     │  (database.py)     │ │
+          │     │  • History DB      │ │
+          │     │  • Session Mgmt    │ │
+          │     └────────────────────┘ │
           │              │
-     ┌────▼──────┐  ┌────▼────────┐
-     │ Skill     │  │ Built-in    │
-     │ Files     │  │ Tools       │
-     │(SKILL.md) │  │             │
-     └───────────┘  └─────────────┘
+          └──────────────┼──────────────┘
                        │
           ┌────────────▼───────────┐
           │  External Services     │
@@ -395,12 +451,13 @@ The system prompt explicitly instructs the AI to save all generated documents to
 | Module | File | Responsibility |
 |--------|------|----------------|
 | Entry Point | `main.py` | Application bootstrap |
-| CLI Handler | `cli.py` | Command parsing, interactive loop |
-| Chat Engine | `chat.py` | Conversation logic, LLM integration |
-| Skills System | `skills.py` | Skill loading, matching, injection |
-| Tools Registry | `tools.py` | Tool definitions, execution |
-| Configuration | `config.py` | Config loading, cascading priorities |
-| Web Server | `web.py` | FastAPI backend, WebSocket handling |
+| CLI Handler | `miniagent/cli.py` | Command parsing, interactive loop |
+| Chat Engine | `miniagent/chat.py` | Conversation logic, LLM integration |
+| Skills System | `miniagent/skills.py` | Skill loading, matching, injection |
+| Tools Registry | `miniagent/tools.py` | Tool definitions, execution |
+| Configuration | `miniagent/config.py` | Config loading, cascading priorities |
+| Web Server | `miniagent/web.py` | FastAPI backend, WebSocket handling |
+| Database | `miniagent/database.py` | SQLite-based conversation history persistence |
 
 #### 4.2.2 Data Flow
 
@@ -408,7 +465,8 @@ The system prompt explicitly instructs the AI to save all generated documents to
 1. User input received (CLI or Web UI)
 2. Input parsed for commands (starts with `/`)
 3. If normal message:
-   - Skills matched based on keywords
+   - Parse `@skill-name` syntax to explicitly activate skills
+   - Auto-match skills based on keywords (unless explicit skills activated)
    - System prompt built with active skills
    - Messages array constructed (system + history + user)
    - LLM API called with tools schema
@@ -416,9 +474,11 @@ The system prompt explicitly instructs the AI to save all generated documents to
    - Tool executed with provided parameters
    - Result appended to messages
    - LLM called again with updated context
-   - Repeat until no more tool calls (max 10 rounds)
+   - Repeat until no more tool calls (dynamic max rounds)
+   - Consecutive failure detection prevents infinite loops
 5. Final response returned to user
 6. History updated (clean version)
+7. History saved to SQLite database
 
 **Skill Loading Flow**:
 1. Scan `skills_dir` for subdirectories
@@ -431,6 +491,13 @@ The system prompt explicitly instructs the AI to save all generated documents to
    - Compare triggers against user input (case-insensitive)
    - Score and sort by match count
    - Return ordered list
+
+**Session Management Flow**:
+1. Each conversation has a `session_id` (default: "default")
+2. New session: `new_session()` generates UUID, clears in-memory history
+3. Switch session: `switch_to_session(id)` loads history from database
+4. Auto-title: First user message used as session title
+5. History persisted in SQLite across sessions
 
 ---
 
@@ -445,6 +512,7 @@ The system prompt explicitly instructs the AI to save all generated documents to
 | **Configuration** | JSON, YAML | Settings and skill metadata |
 | **Search** | DuckDuckGo Search API | Web search functionality |
 | **Runtime** | Node.js (bundled) | JavaScript execution |
+| **Database** | SQLite | Conversation history persistence |
 
 ### 4.4 Dependencies
 
@@ -455,12 +523,14 @@ pyyaml >= 6.0
 fastapi >= 0.100.0
 uvicorn >= 0.20.0
 duckduckgo-search >= 4.0.0  # Optional, for web_search tool
+python-dotenv >= 1.0.0      # Optional, for .env file support
 ```
 
 **System Requirements**:
 - Python 3.8 or higher
 - Internet connection (for API calls)
 - Disk space for skills and output files
+- SQLite3 (built-in to Python standard library)
 
 ---
 
@@ -586,6 +656,10 @@ duckduckgo-search >= 4.0.0  # Optional, for web_search tool
 | FR-06 | Display matched skills before response | Should Have | ✓ Implemented |
 | FR-07 | Handle API errors gracefully | Must Have | ✓ Implemented |
 | FR-08 | Support custom system prompts | Should Have | ✓ Implemented |
+| FR-09 | **New** Multi-session support (new/switch sessions) | Should Have | ✓ Implemented |
+| FR-10 | **New** Persistent history with SQLite | Must Have | ✓ Implemented |
+| FR-11 | **New** Dynamic max tool rounds estimation | Should Have | ✓ Implemented |
+| FR-12 | **New** `@skill-name` syntax for skill activation | Should Have | ✓ Implemented |
 
 ---
 
@@ -593,15 +667,18 @@ duckduckgo-search >= 4.0.0  # Optional, for web_search tool
 
 | ID | Requirement | Priority | Status |
 |----|------------|----------|--------|
-| FR-09 | Load skills from designated directory | Must Have | ✓ Implemented |
-| FR-10 | Parse YAML frontmatter metadata | Must Have | ✓ Implemented |
-| FR-11 | Match skills by keyword triggers | Must Have | ✓ Implemented |
-| FR-12 | Support always-active skills | Must Have | ✓ Implemented |
-| FR-13 | List all available skills | Must Have | ✓ Implemented |
-| FR-14 | Hot reload skills without restart | Must Have | ✓ Implemented |
-| FR-15 | Manually activate specific skills | Should Have | ✓ Implemented |
-| FR-16 | Display skill descriptions and triggers | Should Have | ✓ Implemented |
-| FR-17 | Auto-discover new skills on reload | Must Have | ✓ Implemented |
+| FR-12 | Load skills from designated directory | Must Have | ✓ Implemented |
+| FR-13 | Parse YAML frontmatter metadata | Must Have | ✓ Implemented |
+| FR-14 | Match skills by keyword triggers | Must Have | ✓ Implemented |
+| FR-15 | Support always-active skills | Must Have | ✓ Implemented |
+| FR-16 | List all available skills | Must Have | ✓ Implemented |
+| FR-17 | Hot reload skills without restart | Must Have | ✓ Implemented |
+| FR-18 | Manually activate specific skills | Should Have | ✓ Implemented |
+| FR-19 | Display skill descriptions and triggers | Should Have | ✓ Implemented |
+| FR-20 | Auto-discover new skills on reload | Must Have | ✓ Implemented |
+| FR-21 | **New** `@skill-name` syntax support | Should Have | ✓ Implemented |
+| FR-22 | **New** `find_skills` tool for skill search | Should Have | ✓ Implemented |
+| FR-23 | **New** `use_skill` tool for explicit activation | Should Have | ✓ Implemented |
 
 ---
 
@@ -609,17 +686,22 @@ duckduckgo-search >= 4.0.0  # Optional, for web_search tool
 
 | ID | Requirement | Priority | Status |
 |----|------------|----------|--------|
-| FR-18 | Execute file read/write/edit operations | Must Have | ✓ Implemented |
-| FR-19 | List directory contents (recursive option) | Must Have | ✓ Implemented |
-| FR-20 | Execute shell commands with timeout | Must Have | ✓ Implemented |
-| FR-21 | Run Node.js scripts and inline code | Must Have | ✓ Implemented |
-| FR-22 | Run Python scripts and inline code | Must Have | ✓ Implemented |
-| FR-23 | Perform web searches | Should Have | ✓ Implemented |
-| FR-24 | Fetch and extract web page content | Should Have | ✓ Implemented |
-| FR-25 | Block dangerous commands | Must Have | ✓ Implemented |
-| FR-26 | Limit tool call loops (max 10 rounds) | Must Have | ✓ Implemented |
-| FR-27 | Truncate large outputs | Should Have | ✓ Implemented |
-| FR-28 | Log tool calls for transparency | Should Have | ✓ Implemented |
+| FR-24 | Execute file read/write/edit operations | Must Have | ✓ Implemented |
+| FR-25 | List directory contents (recursive option) | Must Have | ✓ Implemented |
+| FR-26 | Execute shell commands with timeout | Must Have | ✓ Implemented |
+| FR-27 | Run Node.js scripts and inline code | Must Have | ✓ Implemented |
+| FR-28 | Run Python scripts and inline code | Must Have | ✓ Implemented |
+| FR-29 | Perform web searches | Should Have | ✓ Implemented |
+| FR-30 | Fetch and extract web page content | Should Have | ✓ Implemented |
+| FR-31 | Block dangerous commands | Must Have | ✓ Implemented |
+| FR-32 | Limit tool call loops (dynamic max rounds) | Must Have | ✓ Implemented |
+| FR-33 | Truncate large outputs | Should Have | ✓ Implemented |
+| FR-34 | Log tool calls for transparency | Should Have | ✓ Implemented |
+| FR-35 | **New** `find_skills` tool for skill discovery | Should Have | ✓ Implemented |
+| FR-36 | **New** `use_skill` tool for skill activation | Should Have | ✓ Implemented |
+| FR-37 | **New** Consecutive failure detection | Must Have | ✓ Implemented |
+| FR-38 | **New** PowerShell syntax translation | Must Have | ✓ Implemented |
+| FR-39 | **New** UTF-8 encoding fix for Chinese | Must Have | ✓ Implemented |
 
 ---
 
@@ -627,44 +709,66 @@ duckduckgo-search >= 4.0.0  # Optional, for web_search tool
 
 | ID | Requirement | Priority | Status |
 |----|------------|----------|--------|
-| FR-29 | Load config from JSON file | Must Have | ✓ Implemented |
-| FR-30 | Support environment variable overrides | Must Have | ✓ Implemented |
-| FR-31 | Cascading priority (project > user > env > default) | Must Have | ✓ Implemented |
-| FR-32 | Configure model parameters | Must Have | ✓ Implemented |
-| FR-33 | Set custom API endpoints | Should Have | ✓ Implemented |
-| FR-34 | Specify custom skills directory | Should Have | ✓ Implemented |
-| FR-35 | Secure API key handling | Must Have | ✓ Implemented |
+| FR-40 | Load config from JSON file | Must Have | ✓ Implemented |
+| FR-41 | Support environment variable overrides | Must Have | ✓ Implemented |
+| FR-42 | Cascading priority (project > user > env > default) | Must Have | ✓ Implemented |
+| FR-43 | Configure model parameters | Must Have | ✓ Implemented |
+| FR-44 | Set custom API endpoints | Should Have | ✓ Implemented |
+| FR-45 | Specify custom skills directory | Should Have | ✓ Implemented |
+| FR-46 | Secure API key handling | Must Have | ✓ Implemented |
+| FR-47 | **New** Auto-load `.env` file | Should Have | ✓ Implemented |
+| FR-48 | **New** `max_tool_history` parameter | Should Have | ✓ Implemented |
+| FR-49 | **New** `max_tokens` default 32768 | Should Have | ✓ Implemented |
 
 ---
 
-### 6.5 User Interface
-
-#### 6.5.1 CLI Requirements
+### 6.5 Database & Persistence
 
 | ID | Requirement | Priority | Status |
 |----|------------|----------|--------|
-| FR-36 | Interactive REPL loop | Must Have | ✓ Implemented |
-| FR-37 | Display welcome message with system info | Should Have | ✓ Implemented |
-| FR-38 | Support slash commands | Must Have | ✓ Implemented |
-| FR-39 | Handle keyboard interrupts (Ctrl+C) | Must Have | ✓ Implemented |
-| FR-40 | Show tool call progress | Should Have | ✓ Implemented |
-| FR-41 | One-shot query mode (-q flag) | Should Have | ✓ Implemented |
+| FR-50 | SQLite-based history storage | Must Have | ✓ Implemented |
+| FR-51 | Multi-session support | Must Have | ✓ Implemented |
+| FR-52 | Session auto-titling | Should Have | ✓ Implemented |
+| FR-53 | Session listing | Should Have | ✓ Implemented |
+| FR-54 | Session switching | Must Have | ✓ Implemented |
+| FR-55 | History persistence across restarts | Must Have | ✓ Implemented |
+| FR-56 | Session metadata management | Should Have | ✓ Implemented |
 
 ---
 
-#### 6.5.2 Web UI Requirements
+### 6.6 User Interface
+
+#### 6.6.1 CLI Requirements
 
 | ID | Requirement | Priority | Status |
 |----|------------|----------|--------|
-| FR-42 | Responsive design (desktop + mobile) | Must Have | ✓ Implemented |
-| FR-43 | Real-time message streaming via WebSocket | Must Have | ✓ Implemented |
-| FR-44 | Display tool execution status | Must Have | ✓ Implemented |
-| FR-45 | Skill selection dropdown | Should Have | ✓ Implemented |
-| FR-46 | Multiple views (Chat, Skills, Settings) | Should Have | ✓ Implemented |
-| FR-47 | Clear chat button | Must Have | ✓ Implemented |
-| FR-48 | Show system status (model, API, WS) | Should Have | ✓ Implemented |
-| FR-49 | Auto-scroll to latest message | Must Have | ✓ Implemented |
-| FR-50 | Support Shift+Enter for newlines | Should Have | ✓ Implemented |
+| FR-57 | Interactive REPL loop | Must Have | ✓ Implemented |
+| FR-58 | Display welcome message with system info | Should Have | ✓ Implemented |
+| FR-59 | Support slash commands | Must Have | ✓ Implemented |
+| FR-60 | Handle keyboard interrupts (Ctrl+C) | Must Have | ✓ Implemented |
+| FR-61 | Show tool call progress | Should Have | ✓ Implemented |
+| FR-62 | One-shot query mode (-q flag) | Should Have | ✓ Implemented |
+| FR-63 | **New** `/sessions` command | Should Have | ✓ Implemented |
+| FR-64 | **New** `/new` command | Should Have | ✓ Implemented |
+| FR-65 | **New** `/switch` command | Should Have | ✓ Implemented |
+| FR-66 | **New** `/history` command | Should Have | ✓ Implemented |
+| FR-67 | **New** `@skill-name` syntax | Should Have | ✓ Implemented |
+
+---
+
+#### 6.6.2 Web UI Requirements
+
+| ID | Requirement | Priority | Status |
+|----|------------|----------|--------|
+| FR-68 | Responsive design (desktop + mobile) | Must Have | ✓ Implemented |
+| FR-69 | Real-time message streaming via WebSocket | Must Have | ✓ Implemented |
+| FR-70 | Display tool execution status | Must Have | ✓ Implemented |
+| FR-71 | Skill selection dropdown | Should Have | ✓ Implemented |
+| FR-72 | Multiple views (Chat, Skills, Settings) | Should Have | ✓ Implemented |
+| FR-73 | Clear chat button | Must Have | ✓ Implemented |
+| FR-74 | Show system status (model, API, WS) | Should Have | ✓ Implemented |
+| FR-75 | Auto-scroll to latest message | Must Have | ✓ Implemented |
+| FR-76 | Support Shift+Enter for newlines | Should Have | ✓ Implemented |
 
 ---
 
@@ -741,8 +845,9 @@ duckduckgo-search >= 4.0.0  # Optional, for web_search tool
 2. **Python Version**: Minimum Python 3.8 required
 3. **Internet Connection**: Required for API calls and web tools
 4. **Single-User**: Designed for single-user sessions (no multi-user support)
-5. **No Database**: All state in-memory, no persistent storage except files
-6. **Windows-Centric**: Shell tool optimized for Windows CMD (limited cross-platform)
+5. **SQLite Dependency**: Uses SQLite for history persistence (built-in to Python)
+6. **Windows-Centric**: Shell tool optimized for Windows PowerShell (limited cross-platform)
+7. **Package Structure**: Python package format (`miniagent/` directory)
 
 ---
 
@@ -767,14 +872,15 @@ duckduckgo-search >= 4.0.0  # Optional, for web_search tool
 
 ## 9. Future Enhancements (Roadmap)
 
-### 9.1 Short-Term (v1.2 - Next 3 Months)
+### 9.1 Short-Term (v1.3 - Next 3 Months)
 
+- [x] **Conversation Persistence**: Save/load conversation histories (✓ Implemented in v1.2.0)
 - [ ] **Multi-Model Support**: Add support for other LLM providers (OpenAI, Anthropic)
 - [ ] **Skill Marketplace**: Centralized repository for sharing skills
-- [ ] **Conversation Persistence**: Save/load conversation histories
 - [ ] **Enhanced Web UI**: Dark mode, themes, customizable layouts
 - [ ] **Tool Composition**: Chain multiple tools in single workflow
 - [ ] **Better Error Handling**: Retry logic for transient failures
+- [ ] **Multi-Session Management**: Session listing and switching (✓ Implemented in v1.2.0)
 
 ---
 
@@ -1017,6 +1123,7 @@ export MINIAGENT_MODEL="qwen-max"
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
 | 1.0 | 2026-05-17 | MiniAgent Team | Initial PRD creation |
+| 1.1 | 2026-06-28 | MiniAgent Team | Updated to reflect v1.2.0 implementation: added database module (HistoryDB), added find_skills and use_skill tools, updated tool count to 12, updated configuration parameters (max_tokens=32768, max_tool_history), added multi-session support, added dynamic max tool rounds estimation, added @skill-name syntax, updated architecture diagram, added PowerShell syntax translation |
 
 ---
 

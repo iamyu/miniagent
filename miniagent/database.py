@@ -60,13 +60,32 @@ class HistoryDB:
                     title TEXT,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    message_count INTEGER DEFAULT 0
+                    message_count INTEGER DEFAULT 0,
+                    total_prompt_tokens INTEGER DEFAULT 0,
+                    total_completion_tokens INTEGER DEFAULT 0,
+                    total_tokens INTEGER DEFAULT 0
                 )
             """)
+
+            # Migrate: add token columns if sessions table already exists without them
+            self._migrate_token_columns(cursor)
             
             conn.commit()
         finally:
             conn.close()
+
+    @staticmethod
+    def _migrate_token_columns(cursor) -> None:
+        """Add token tracking columns to sessions table if they don't exist."""
+        cursor.execute("PRAGMA table_info(sessions)")
+        columns = {row[1] for row in cursor.fetchall()}
+        for col_name, col_def in [
+            ("total_prompt_tokens", "INTEGER DEFAULT 0"),
+            ("total_completion_tokens", "INTEGER DEFAULT 0"),
+            ("total_tokens", "INTEGER DEFAULT 0"),
+        ]:
+            if col_name not in columns:
+                cursor.execute(f"ALTER TABLE sessions ADD COLUMN {col_name} {col_def}")
 
     def save_message(
         self,
@@ -340,6 +359,7 @@ class HistoryDB:
                 """
                 SELECT s.session_id, s.title, s.created_at, s.updated_at,
                        s.message_count,
+                       s.total_prompt_tokens, s.total_completion_tokens, s.total_tokens,
                        (SELECT c.content FROM conversations c
                         WHERE c.session_id = s.session_id AND c.role = 'user'
                         ORDER BY c.timestamp ASC LIMIT 1) as first_message
@@ -357,6 +377,9 @@ class HistoryDB:
                     "created_at": row["created_at"],
                     "updated_at": row["updated_at"],
                     "message_count": row["message_count"],
+                    "total_prompt_tokens": row["total_prompt_tokens"] or 0,
+                    "total_completion_tokens": row["total_completion_tokens"] or 0,
+                    "total_tokens": row["total_tokens"] or 0,
                     "first_message": row["first_message"],
                 }
                 for row in rows
@@ -375,3 +398,68 @@ class HistoryDB:
             List of message dictionaries
         """
         return self.get_history(session_id=session_id, limit=limit)
+
+    def update_session_tokens(
+        self,
+        session_id: str,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+    ) -> None:
+        """Accumulate token usage for a session.
+
+        Args:
+            session_id: Session identifier.
+            prompt_tokens: Prompt tokens from this API call.
+            completion_tokens: Completion tokens from this API call.
+        """
+        total = prompt_tokens + completion_tokens
+        if total == 0:
+            return
+
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE sessions SET
+                    total_prompt_tokens = total_prompt_tokens + ?,
+                    total_completion_tokens = total_completion_tokens + ?,
+                    total_tokens = total_tokens + ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE session_id = ?
+                """,
+                (prompt_tokens, completion_tokens, total, session_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_session_tokens(self, session_id: str) -> dict[str, int]:
+        """Get accumulated token usage for a session.
+
+        Args:
+            session_id: Session identifier.
+
+        Returns:
+            Dict with prompt_tokens, completion_tokens, total_tokens.
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT total_prompt_tokens, total_completion_tokens, total_tokens
+                FROM sessions WHERE session_id = ?
+                """,
+                (session_id,),
+            )
+            row = cursor.fetchone()
+            if row:
+                return {
+                    "prompt_tokens": row["total_prompt_tokens"] or 0,
+                    "completion_tokens": row["total_completion_tokens"] or 0,
+                    "total_tokens": row["total_tokens"] or 0,
+                }
+            return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        finally:
+            conn.close()

@@ -187,6 +187,7 @@ async def api_config():
         "temperature": cfg.get("temperature", 0.7),
         "max_tokens": cfg.get("max_tokens", 32768),
         "max_history": cfg.get("max_history", 20),
+        "max_tool_history": cfg.get("max_tool_history", 20),
         "has_api_key": bool(cfg.get("api_key")),
     }
 
@@ -194,7 +195,7 @@ async def api_config():
 @app.post("/api/config")
 async def api_save_config(data: dict[str, Any]):
     """Save configuration values to user-level config file."""
-    allowed_keys = {"model", "base_url", "temperature", "max_tokens", "max_history", "api_key"}
+    allowed_keys = {"model", "base_url", "temperature", "max_tokens", "max_history", "max_tool_history", "api_key"}
     update = {k: v for k, v in data.items() if k in allowed_keys}
 
     if "max_tokens" in update:
@@ -367,7 +368,7 @@ async def api_chat(body: dict[str, Any]):
                 response = await asyncio.to_thread(
                     engine.chat, user_input,
                     active_skills=at_skills,
-                    auto_match=True,
+                    auto_match=False,  # User explicitly chose a skill — don't auto-match others
                 )
                 return {"response": response}
             except Exception as e:
@@ -562,14 +563,17 @@ async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
 
     matched_skills: list[Skill] = []
     matched_skills.extend(at_skills)
-    auto_matched = engine.skills.match_triggers(cleaned_input)
-    existing_names = {s.name for s in matched_skills}
-    for s in auto_matched:
-        if s.name not in existing_names:
-            matched_skills.append(s)
-            existing_names.add(s.name)
+    # Only auto-match if user didn't explicitly specify a skill via @
+    if not at_skills:
+        auto_matched = engine.skills.match_triggers(cleaned_input)
+        existing_names = {s.name for s in matched_skills}
+        for s in auto_matched:
+            if s.name not in existing_names:
+                matched_skills.append(s)
+                existing_names.add(s.name)
 
-    system_prompt = engine.build_system_prompt(matched_skills)
+    # Build stable system prompt (identical every call → LLM KV cache hit)
+    system_prompt = engine.build_system_prompt()
 
     if matched_skills:
         names = [s.name for s in matched_skills]
@@ -580,18 +584,40 @@ async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
 
     # --- Build messages for API ---
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+
+    # Append per-call dynamic system messages (extra skills, html-ppt guidance)
+    dynamic_msgs = engine._build_dynamic_messages(matched_skills)
+    messages.extend(dynamic_msgs)
+
     messages.extend(engine.history)
     # Use cleaned_input (with @skill-name removed) if non-empty, otherwise use original
     llm_input = cleaned_input if cleaned_input else user_input
     messages.append({"role": "user", "content": llm_input})
+    prefix_count = len(messages)  # system + history + user — never trimmed
 
     tool_definitions = engine.tools.get_definitions()
     tool_rounds = 0
-    max_rounds = 30
+    max_rounds = engine._estimate_max_rounds(user_input, matched_skills)
+
+    # Determine if this is a PPT task (for dynamic slide-count adjustment)
+    _skill_names: set[str] = {s.name for s in matched_skills}
+    _is_heavy = bool(_skill_names & engine._HEAVY_SKILLS)
+
+    # Reset slide tracking for this chat call
+    engine._detected_slide_count = 0
+    engine._slide_paths.clear()
 
     # Track consecutive failures per tool name to break infinite retry loops
     consecutive_failures: dict[str, int] = {}
     MAX_CONSECUTIVE_FAILURES = 3
+
+    # Token usage accumulators for this streaming chat call
+    _call_prompt_tokens = 0
+    _call_completion_tokens = 0
+
+    # Progress checkpoint tracking (for PPT/doc tasks)
+    _round_counter = 0
+    _CHECKPOINT_INTERVAL = 5  # Inject progress summary every N LLM rounds
 
     # --- Async HTTP client ---
     _http_timeout = httpx.Timeout(30.0, connect=30.0, read=600.0, write=30.0, pool=10.0)
@@ -608,17 +634,45 @@ async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
             "temperature": engine.config.get("temperature", 0.7),
             "max_tokens": engine.config.get("max_tokens", 32768),
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if tool_definitions:
             kwargs["tools"] = tool_definitions
 
-        msg_preview = messages[-1].get("content", "") if messages else ""
+        # Debug log: dump full prompt sent to LLM (truncate individual msgs)
         logger.debug(
-            f"[ws_stream] round={tool_rounds}, model={kwargs['model']}, "
-            f"max_tokens={kwargs['max_tokens']}, temp={kwargs['temperature']}, "
-            f"msg_count={len(messages)}, tools={len(tool_definitions)}"
+            "[llm_request] round=%d, model=%s, max_tokens=%d, temp=%.1f, "
+            "msg_count=%d, tools=%d",
+            tool_rounds, kwargs['model'], kwargs['max_tokens'],
+            kwargs['temperature'], len(messages), len(tool_definitions),
         )
-        logger.debug(f"[ws_stream] last_msg_preview={msg_preview[:300]}")
+        _req_lines = ["=== LLM REQUEST ==="]
+        for _i, _m in enumerate(messages):
+            _role = _m.get("role", "?")
+            _content = str(_m.get("content", "") or "")
+            _tc = _m.get("tool_calls")
+            _tcid = _m.get("tool_call_id", "")
+            if _tc:
+                _tc_parts = []
+                for _t in _tc:
+                    _fn = _t.get("function", {})
+                    _tc_parts.append(
+                        f"{_fn.get('name','?')}(args={_fn.get('arguments','')[:200]})"
+                    )
+                _req_lines.append(
+                    f"[{_i}] role={_role}, tool_calls=[{'; '.join(_tc_parts)}]"
+                )
+            elif _tcid:
+                _req_lines.append(
+                    f"[{_i}] role={_role}, tool_call_id={_tcid}, "
+                    f"content={_content[:500]}"
+                )
+            else:
+                _req_lines.append(
+                    f"[{_i}] role={_role}, content={_content[:800]}"
+                )
+        _req_lines.append("=== END LLM REQUEST ===")
+        logger.debug("\n".join(_req_lines))
 
         # ================================================================
         # Phase 1: Collect streaming data into memory buffers
@@ -648,6 +702,7 @@ async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
         _stream_aiter = stream.__aiter__()
         _chunk_timeout = 120  # initial timeout between chunks
         _stream_start_time = time.time()
+        _stream_round_usage = None  # Captured from final chunk (include_usage=True)
 
         # --- Stream iteration ---
         logger.debug(f"[ws_stream] round={tool_rounds}, streaming started...")
@@ -682,6 +737,10 @@ async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
             _last_chunk_time = time.time()
             _chunk_timeout = 120  # Reset after successful chunk
             chunk_count += 1
+
+            # Capture usage BEFORE checking choices (final chunk often has usage but no choices)
+            if chunk.usage:
+                _stream_round_usage = chunk.usage
 
             if not chunk.choices:
                 continue
@@ -764,6 +823,20 @@ async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
             f"tool_call_args_len={total_tc_args}, finish_reason={finish_reason}"
         )
 
+        # --- Token usage: log & accumulate ---
+        if _stream_round_usage:
+            pt = _stream_round_usage.prompt_tokens or 0
+            ct = _stream_round_usage.completion_tokens or 0
+            tt = _stream_round_usage.total_tokens or pt + ct
+            _call_prompt_tokens += pt
+            _call_completion_tokens += ct
+            logger.info(
+                "[token_usage] round=%d, prompt_tokens=%d, completion_tokens=%d, total=%d",
+                tool_rounds, pt, ct, tt,
+            )
+        else:
+            logger.debug("[token_usage] round=%d, usage=N/A (not returned in stream)", tool_rounds)
+
         # Stream ended without finish_reason → may be truncated
         if not finish_reason:
             logger.warning(
@@ -784,29 +857,19 @@ async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
         # ================================================================
         full_content = "".join(content_parts)
 
-        # ---- Debug: save raw LLM response to log file ----
-        try:
-            log_dir = get_app_dir() / "debug"
-            log_dir.mkdir(parents=True, exist_ok=True)
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            log_file = log_dir / f"llm_response_{ts}.log"
-            tc_names = {k: v['name'] for k, v in tool_calls_data.items()}
-            lines = [
-                f"# round={tool_rounds}, model={kwargs['model']}, max_tokens={kwargs['max_tokens']}",
-                f"# timestamp={time.strftime('%Y-%m-%d %H:%M:%S')}",
-                "=" * 60,
-                full_content,
-                "=" * 60,
-                f"# tool_calls: {json.dumps(tc_names, ensure_ascii=False)}",
-            ]
-            log_file.write_text("\n".join(lines), encoding="utf-8")
-            logger.debug(f"[ws_stream] LLM raw response saved to: {log_file}")
-        except Exception as e:
-            logger.error(f"[ws_stream] Failed to save LLM response log: {e}")
+        # ---- Debug: log raw LLM response with boundary markers ----
+        tc_names = {k: v['name'] for k, v in tool_calls_data.items()}
+        logger.debug(
+            "[llm_response] round=%d, model=%s, max_tokens=%d, content_len=%d, tool_calls=%s\n"
+            "=== LLM RAW RESPONSE ===\n%s\n=== END LLM RAW RESPONSE ===",
+            tool_rounds, kwargs['model'], kwargs['max_tokens'],
+            len(full_content), json.dumps(tc_names, ensure_ascii=False),
+            full_content,
+        )
 
         if tool_calls_data:
             logger.debug(
-                f"[ws_stream] round={tool_rounds}, tool_calls="
+                f"[llm_response] round={tool_rounds}, tool_calls="
                 f"{json.dumps({k: {'name': v['name'], 'args_preview': v['arguments'][:200]} for k, v in tool_calls_data.items()}, ensure_ascii=False)}"
             )
 
@@ -852,7 +915,9 @@ async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
         # No tool calls at all → done
         if not tool_calls_data:
             await _ws_safe_send(ws, {"type": "done"})
-            engine._update_history(user_input, full_content)
+            engine._update_history(user_input, full_content,
+                                   prompt_tokens=_call_prompt_tokens,
+                                   completion_tokens=_call_completion_tokens)
             return
 
         # All tool calls rejected → send error and stop (don't let model retry)
@@ -890,10 +955,19 @@ async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
             result = await asyncio.to_thread(engine.tools.execute, fn_name, fn_args)
             tool_rounds += 1
 
+            # Dynamically adjust max_rounds if new slides/pages detected
+            if _is_heavy:
+                max_rounds = engine._check_and_adjust_max_rounds(
+                    fn_name, fn_args, max_rounds, is_heavy=True,
+                )
+
             # Track consecutive failures to break infinite retry loops
             _track_tool_failure(fn_name, result, consecutive_failures)
 
-            # Notify client about result (send full result; frontend will collapse)
+            # Truncate result to save context tokens
+            truncated_result = ChatEngine._truncate_tool_result(fn_name, result)
+
+            # Notify client about result (send FULL result to frontend, not truncated)
             # Also send formatted args for display (e.g. HTML content with proper line breaks)
             formatted_args = json.dumps(fn_args, indent=2, ensure_ascii=False)
             await _ws_safe_send(ws, {
@@ -905,11 +979,69 @@ async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
                 "args": formatted_args,
             })
 
-            # Add tool result to message history
+            # Add tool result to message history (truncated version for LLM context)
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc["data"]["id"],
-                "content": result,
+                "content": truncated_result,
+            })
+
+        # Sliding window: trim old tool messages to control context size.
+        # For PPT/doc tasks, scale history window by detected slide count
+        # so the model retains context of all previously generated slides.
+        config_history = engine.config.get("max_tool_history", 20)
+        if engine._detected_slide_count > 0:
+            # Each slide ≈ 6 rounds (12 tool msgs); keep all + buffer
+            max_tool_msgs = max(config_history, engine._detected_slide_count * 12 + 20)
+        else:
+            max_tool_msgs = max(config_history, max_rounds)
+        tool_msg_count = len(messages) - prefix_count
+        if max_tool_msgs > 0 and tool_msg_count > max_tool_msgs:
+            excess = tool_msg_count - max_tool_msgs
+            del messages[prefix_count:prefix_count + excess]
+            logger.debug(
+                "[ws_stream] Trimmed %d old tool messages (kept %d, total=%d)",
+                excess, max_tool_msgs, len(messages),
+            )
+
+        # ── Progress checkpoint: inject summary for PPT/doc tasks ──
+        # Use in-place replace (not insert) to keep prefix structure stable
+        # for LLM prompt caching.
+        _round_counter += 1
+        if (
+            _is_heavy
+            and _round_counter % _CHECKPOINT_INTERVAL == 0
+            and engine._detected_slide_count > 0
+        ):
+            slide_names = sorted(engine._slide_paths)
+            overview = ", ".join(slide_names[:8])
+            if len(slide_names) > 8:
+                overview += f"... (共 {len(slide_names)} 个)"
+            checkpoint_msg = {
+                "role": "system",
+                "content": (
+                    f"[进度] 第 {_round_counter} 轮 LLM 调用: "
+                    f"已生成 {engine._detected_slide_count} 个 slide 文件 ({overview})，"
+                    f"共 {tool_rounds} 次工具调用"
+                ),
+            }
+            # Replace existing checkpoint in-place, or insert on first time
+            existing = messages[prefix_count] if len(messages) > prefix_count else None
+            if existing is not None and existing.get("role") == "system":
+                messages[prefix_count] = checkpoint_msg
+            else:
+                messages.insert(prefix_count, checkpoint_msg)
+                prefix_count += 1
+            logger.debug(
+                "[ws_stream] Injected progress checkpoint at round %d: %d slides",
+                _round_counter, engine._detected_slide_count,
+            )
+            await _ws_safe_send(ws, {
+                "type": "status",
+                "content": (
+                    f"📊 进度: 第 {_round_counter} 轮, "
+                    f"已生成 {engine._detected_slide_count} 个 slide"
+                ),
             })
 
     # --- Exceeded max tool rounds ---
@@ -920,7 +1052,9 @@ async def _stream_chat(engine: ChatEngine, ws: WebSocket, user_input: str):
     logger.warning(f"[ws_stream] max tool rounds ({max_rounds}) exceeded")
     await _ws_safe_send(ws, {"type": "text", "content": warning})
     await _ws_safe_send(ws, {"type": "done"})
-    engine._update_history(user_input, warning)
+    engine._update_history(user_input, warning,
+                           prompt_tokens=_call_prompt_tokens,
+                           completion_tokens=_call_completion_tokens)
 
 
 def _handle_command(engine: ChatEngine, cmd: str) -> dict[str, Any]:
@@ -978,4 +1112,16 @@ async def index():
 
 
 # Mount static files (must be last)
-app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
+# Custom subclass to add Cache-Control header to prevent stale browser cache
+class _NoCacheStaticFiles(StaticFiles):
+    async def __call__(self, scope, receive, send):
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                headers = dict(message.get("headers", []))
+                # Add no-cache for JS/CSS to avoid stale cache after code updates
+                headers[b"cache-control"] = b"no-cache, no-store, must-revalidate"
+                message["headers"] = list(headers.items())
+            await send(message)
+        await super().__call__(scope, receive, send_wrapper)
+
+app.mount("/static", _NoCacheStaticFiles(directory=str(_static_dir)), name="static")

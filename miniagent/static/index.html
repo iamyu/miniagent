@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MiniAgent - AI 助手</title>
-    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="stylesheet" href="/static/styles.css?v=20250628">
 </head>
 <body>
     <div class="app-container">
@@ -114,30 +114,42 @@
                         <p>轻量级 AI Agent，支持 Skills + Tools，帮你完成各种任务</p>
                         <div class="welcome-features">
                             <div class="feature-card" data-action="file">
-                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                                    <polyline points="14 2 14 8 20 8"/>
-                                </svg>
-                                <span>文件操作</span>
+                                <div class="feature-default">
+                                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                                        <polyline points="14 2 14 8 20 8"/>
+                                    </svg>
+                                    <span>文件操作</span>
+                                </div>
+                                <div class="feature-desc">读写、搜索、编辑本地文件，支持拖拽上传与批量处理</div>
                             </div>
                             <div class="feature-card" data-action="code">
-                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                    <polyline points="16 18 22 12 16 6"/>
-                                    <polyline points="8 6 2 12 8 18"/>
-                                </svg>
-                                <span>代码执行</span>
+                                <div class="feature-default">
+                                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <polyline points="16 18 22 12 16 6"/>
+                                        <polyline points="8 6 2 12 8 18"/>
+                                    </svg>
+                                    <span>代码执行</span>
+                                </div>
+                                <div class="feature-desc">运行 Python / Shell 命令，实时查看执行结果与错误输出</div>
                             </div>
                             <div class="feature-card" data-action="ai">
-                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
-                                </svg>
-                                <span>AI 对话</span>
+                                <div class="feature-default">
+                                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+                                    </svg>
+                                    <span>AI 对话</span>
+                                </div>
+                                <div class="feature-desc">支持多模型、流式输出，结合 Tools 与 Skills 完成复杂任务</div>
                             </div>
                             <div class="feature-card" data-action="skills">
-                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                    <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>
-                                </svg>
-                                <span>Skills</span>
+                                <div class="feature-default">
+                                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>
+                                    </svg>
+                                    <span>Skills</span>
+                                </div>
+                                <div class="feature-desc">使用预置技能扩展能力，支持自定义 Skill 实现专业领域任务<a href="/static/skills-help.html" class="feature-help-link" onclick="event.stopPropagation()">📖 帮助</a></div>
                             </div>
                         </div>
                     </div>
@@ -195,7 +207,7 @@
             <div class="view-container" id="view-skills">
                 <div class="skills-header">
                     <h2>Skills 技能中心</h2>
-                    <p>选择或使用各种技能来完成任务</p>
+                    <p>选择或使用各种技能来完成任务 &nbsp;<a href="/static/skills-help.html" class="skills-help-link">📖 使用帮助</a></p>
                 </div>
                 <div class="skills-grid" id="skills-grid">
                     <div class="loading">加载中...</div>
@@ -241,6 +253,6 @@
         </main>
     </div>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=20250628"></script>
 </body>
 </html>

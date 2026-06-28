@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+html { background: #fff; }
+body {
+  width: 720pt; height: 405pt; margin: 0; padding: 0;
+  font-family: Arial, sans-serif;
+  display: flex;
+  flex-direction: column;
+  background: #FFFFFF;
+}
+.header {
+  background: #FFFFFF;
+  padding: 14pt 0 10pt 0;
+  position: relative;
+  flex-shrink: 0;
+}
+.header::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3pt;
+  background: #FBCE07;
+}
+.header-inner {
+  padding: 0 28pt;
+}
+.header h1 { margin: 0; font-size: 18pt; color: #1A1A1A; font-weight: bold; }
+.content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 18pt 28pt 14pt 28pt;
+  gap: 12pt;
+  overflow: hidden;
+}
+/* ─── 可复用组件 ─── */
+
+/* 红色左边框信息卡 */
+.info-card {
+  background: #FFF8F8;
+  border-left: 5pt solid #DD1D21;
+  padding: 10pt 14pt;
+  border-radius: 2pt;
+}
+.info-card p { margin: 0 0 4pt 0; font-size: 10pt; color: #333333; line-height: 1.45; }
+
+/* 黄色顶部三列卡片 */
+.card-row {
+  display: flex;
+  flex-direction: row;
+  gap: 14pt;
+}
+.yellow-card {
+  flex: 1;
+  background: #FFFBF0;
+  border-top: 3pt solid #FBCE07;
+  padding: 10pt 10pt;
+  border-radius: 0 0 3pt 3pt;
+}
+.yellow-card h3 { margin: 0 0 6pt 0; font-size: 11pt; color: #DD1D21; font-weight: bold; }
+.yellow-card p { margin: 0 0 3pt 0; font-size: 8.5pt; color: #444444; line-height: 1.35; }
+
+/* 技术架构/重点突显条（白色底 + 红色左边框，避免大块红色刺眼） */
+.highlight-bar {
+  background: #F8F8F8;
+  border-left: 4pt solid #DD1D21;
+  padding: 10pt 14pt;
+  border-radius: 2pt;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 16pt;
+}
+.highlight-bar p { margin: 0; font-size: 10pt; color: #333333; }
+.highlight-bar h3 { margin: 0; font-size: 14pt; color: #DD1D21; font-weight: bold; }
+
+/* 小节标题 */
+.section-label { margin: 0; }
+.section-label p { margin: 0 0 6pt 0; font-size: 9pt; color: #DD1D21; font-weight: bold; text-transform: uppercase; letter-spacing: 1pt; }
+
+/* 双列布局 */
+.two-col {
+  display: flex;
+  flex-direction: row;
+  gap: 16pt;
+  flex: 1;
+}
+.col { flex: 1; display: flex; flex-direction: column; gap: 6pt; }
+
+/* 三列布局 */
+.three-col {
+  display: flex;
+  flex-direction: row;
+  gap: 14pt;
+}
+.col-3 { flex: 1; display: flex; flex-direction: column; gap: 6pt; }
+
+/* 维度小卡片（用于 requirements/achievements） */
+.dim-card {
+  background: #FFF8F8;
+  border-left: 4pt solid #DD1D21;
+  padding: 6pt 10pt;
+  border-radius: 2pt;
+}
+.dim-card h3 { margin: 0 0 4pt 0; font-size: 10pt; color: #DD1D21; font-weight: bold; }
+.dim-card ul { margin: 0; padding: 0 0 0 14pt; }
+.dim-card ul li { margin: 0 0 2pt 0; font-size: 8pt; color: #333333; line-height: 1.3; }
+
+/* 阶段徽章 */
+.badge-done { background: #27AE60; color: #fff; padding: 3pt 8pt; border-radius: 4pt; font-size: 8pt; font-weight: bold; }
+.badge-active { background: #FBCE07; color: #1A1A1A; padding: 3pt 8pt; border-radius: 4pt; font-size: 8pt; font-weight: bold; }
+.badge-future { background: #EEEEEE; color: #888; padding: 3pt 8pt; border-radius: 4pt; font-size: 8pt; }
+
+/* 数据统计卡片 */
+.stat-card {
+  background: #FFFBF0;
+  border-top: 3pt solid #FBCE07;
+  padding: 10pt;
+  border-radius: 0 0 3pt 3pt;
+  text-align: center;
+}
+.stat-card h3 { margin: 0; font-size: 22pt; color: #DD1D21; font-weight: bold; }
+.stat-card p { margin: 2pt 0 0 0; font-size: 8pt; color: #555555; }
+
+/* Do/Don't 对比表 */
+.compare-row {
+  display: flex;
+  flex-direction: row;
+  gap: 14pt;
+}
+.do-box { flex: 1; background: #F0FFF0; border-left: 4pt solid #27AE60; padding: 8pt 10pt; border-radius: 2pt; }
+.dont-box { flex: 1; background: #FFF0F0; border-left: 4pt solid #E74C3C; padding: 8pt 10pt; border-radius: 2pt; }
+.do-box h3 { margin: 0 0 4pt 0; font-size: 10pt; color: #27AE60; font-weight: bold; }
+.dont-box h3 { margin: 0 0 4pt 0; font-size: 10pt; color: #E74C3C; font-weight: bold; }
+.do-box ul, .dont-box ul { margin: 0; padding: 0 0 0 14pt; }
+.do-box ul li, .dont-box ul li { margin: 0 0 2pt 0; font-size: 8pt; color: #333; line-height: 1.3; }
+
+/* 章节分隔页 — 整页居中显示章节名和序号 */
+body.section-divider {
+  justify-content: center;
+  align-items: center;
+  background: #FFFFFF;
+}
+body.section-divider .header { display: none; }
+body.section-divider .content { display: none; }
+.divider-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+}
+.divider-number {
+  font-size: 60pt;
+  color: #DD1D21;
+  font-weight: bold;
+  margin: 0;
+  line-height: 1;
+}
+.divider-title {
+  font-size: 22pt;
+  color: #1A1A1A;
+  font-weight: bold;
+  margin: 10pt 0 0 0;
+}
+.divider-bar {
+  width: 60pt;
+  height: 3pt;
+  background: #FBCE07;
+  margin: 14pt 0 0 0;
+}
+
+/* 目录页 — 编号章节列表 */
+.toc-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.toc-item {
+  display: flex;
+  flex-direction: row;
+  align-items: baseline;
+  margin: 0 0 8pt 0;
+  font-size: 11pt;
+  color: #1A1A1A;
+}
+.toc-num {
+  font-size: 14pt;
+  color: #DD1D21;
+  font-weight: bold;
+  width: 24pt;
+  flex-shrink: 0;
+}
+.toc-name {
+  font-size: 11pt;
+  color: #1A1A1A;
+}
+
+/* FAQ 2x2 网格 */
+.faq-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8pt;
+}
+.faq-row {
+  display: flex;
+  flex-direction: row;
+  gap: 14pt;
+}
+.faq-item {
+  flex: 1;
+  background: #FFF8F8;
+  border-left: 4pt solid #DD1D21;
+  padding: 6pt 10pt;
+  border-radius: 2pt;
+}
+.faq-item h3 { margin: 0 0 3pt 0; font-size: 9pt; color: #DD1D21; font-weight: bold; }
+.faq-item p { margin: 0; font-size: 8pt; color: #333333; line-height: 1.3; }
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="header-inner">
+    <h1>Page Title</h1>
+  </div>
+</div>
+<div class="content">
+  <!-- 页面内容放在这里 -->
+</div>
+</body>
+</html>

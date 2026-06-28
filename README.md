@@ -17,8 +17,13 @@ npm install
 
 # 4. 启动
 python main.py web        # Web UI（推荐），浏览器打开 http://localhost:7860
+python main.py web -debug  # Web UI + Debug， debug log 在 C:\Users\Lenovo\.miniagent
+查看log：Get-Content .\debug_default.log -Wait -Tail 20 -Encoding UTF8
+
 python main.py chat       # 终端交互式对话
 python main.py chat -q "你好"  # 单次问答
+
+
 ```
 
 ## 配置

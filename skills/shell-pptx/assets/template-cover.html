@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+html { background: #fff; }
+body {
+  width: 720pt; height: 405pt; margin: 0; padding: 0;
+  font-family: Arial, sans-serif;
+  display: flex;
+  background: #FFFFFF;
+}
+.left-bar {
+  width: 8pt;
+  background: #FBCE07;
+  height: 405pt;
+  flex-shrink: 0;
+}
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 0 40pt 0 36pt;
+}
+.label-top { margin: 0 0 10pt 0; }
+.label-top p {
+  margin: 0;
+  font-size: 9pt;
+  color: #DD1D21;
+  letter-spacing: 2pt;
+  font-weight: bold;
+  text-transform: uppercase;
+}
+.title-block { margin: 0 0 16pt 0; }
+.title-block h1 {
+  margin: 0 0 4pt 0;
+  font-size: 30pt;
+  color: #1A1A1A;
+  font-weight: bold;
+  line-height: 1.1;
+}
+.title-block h2 {
+  margin: 0;
+  font-size: 16pt;
+  color: #DD1D21;
+  font-weight: normal;
+}
+.subtitle { margin: 0 0 20pt 0; }
+.subtitle p {
+  margin: 0;
+  font-size: 11pt;
+  color: #555555;
+  line-height: 1.5;
+}
+.bottom-strip {
+  position: absolute;
+  bottom: 0; left: 0; right: 0;
+  height: 42pt;
+  background: #DD1D21;
+  display: flex;
+  align-items: center;
+  padding: 0 44pt;
+}
+.bottom-strip p { margin: 0; font-size: 9pt; color: rgba(255,255,255,0.85); }
+.yellow-accent {
+  position: absolute;
+  bottom: 42pt; left: 0; right: 0;
+  height: 4pt;
+  background: #FBCE07;
+}
+</style>
+</head>
+<body>
+<div style="position:absolute;top:0;left:0;width:720pt;height:405pt;background:#FFFFFF;"></div>
+<div class="left-bar" style="position:relative;z-index:1;"></div>
+<div class="main" style="position:relative;z-index:1;">
+  <div class="label-top"><p>LABEL TEXT</p></div>
+  <div class="title-block">
+    <h1>Main Title</h1>
+    <h2>Subtitle</h2>
+  </div>
+  <div class="subtitle">
+    <p>Description or additional info</p>
+  </div>
+</div>
+<div class="yellow-accent" style="position:absolute;z-index:2;"></div>
+<div class="bottom-strip" style="position:absolute;z-index:2;">
+  <p>Confidential | Organization | Year</p>
+</div>
+</body>
+</html>
